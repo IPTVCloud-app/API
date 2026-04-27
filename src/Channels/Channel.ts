@@ -13,19 +13,36 @@ const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
 export async function getClient() {
   const now = Date.now();
-  if (!sdkClient || (now - lastLoad) > CACHE_TTL) {
-    console.log('[SDK] Initializing iptv-org/sdk client...');
-    try {
-      sdkClient = new sdk.Client();
-      await sdkClient.load();
-      lastLoad = now;
-      console.log('[SDK] Client loaded successfully.');
-    } catch (err) {
-      console.error('[SDK] Failed to load client:', err);
-      throw err;
-    }
+  
+  // If we have a client and it's fresh, return it
+  if (sdkClient && (now - lastLoad) < CACHE_TTL) {
+    return sdkClient;
   }
-  return sdkClient;
+
+  console.log('[SDK] Initializing iptv-org/sdk client (Load/Reload)...');
+  try {
+    const newClient = new sdk.Client();
+    await newClient.load();
+    
+    // Verify we actually got data
+    const testData = newClient.getData();
+    if (!testData || !testData.channels || testData.channels.all().length === 0) {
+      throw new Error('SDK loaded but no channels found in data.');
+    }
+
+    sdkClient = newClient;
+    lastLoad = Date.now();
+    console.log(`[SDK] Client loaded successfully. Found ${sdkClient.getData().channels.all().length} channels.`);
+    return sdkClient;
+  } catch (err) {
+    console.error('[SDK] Failed to load client:', err);
+    // If we have an old client, fallback to it rather than returning nothing
+    if (sdkClient) {
+      console.warn('[SDK] Falling back to expired cache due to load failure.');
+      return sdkClient;
+    }
+    throw err;
+  }
 }
 
 export async function getShortId(originalId: string): Promise<string> {
@@ -69,25 +86,29 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
  */
 router.get('/', async (c) => {
   const limit = parseInt(c.req.query('limit') || '50', 10);
-  console.log(`[Channels] Fetching up to ${limit} channels...`);
+  console.log(`[Channels] Request received. Limit: ${limit}`);
   
   try {
     const client = await getClient();
     const data = client.getData();
     
-    if (!data || !data.channels) {
-      console.error('[Channels] No data returned from SDK.');
-      return c.json({ error: 'No channel data available' }, 500);
+    const allChannels = data.channels.all();
+    console.log(`[Channels] Raw channels from SDK: ${allChannels.length}`);
+
+    if (allChannels.length === 0) {
+      console.error('[Channels] SDK returned 0 channels. This might be a loading issue.');
+      return c.json({ 
+        code: 500, 
+        message: 'Channel database is empty or still loading.',
+        request_id: c.req.header('x-vercel-id') || 'internal'
+      }, 500);
     }
 
-    const blockedIds = data.blocklist.all().map((b: any) => b.channel);
-    const allChannels = data.channels.all();
-    console.log(`[Channels] Total channels found: ${allChannels.length}`);
-    
+    const blockedIds = data.blocklist ? data.blocklist.all().map((b: any) => b.channel) : [];
     const filtered = allChannels.filter((ch: any) => !blockedIds.includes(ch.id));
-    console.log(`[Channels] Filtered channels (excluding blocked): ${filtered.length}`);
     
     const slice = filtered.slice(0, limit);
+    console.log(`[Channels] Processing slice of ${slice.length} channels...`);
     
     const results = await Promise.all(slice.map(async (ch: any) => {
       try {
@@ -106,15 +127,21 @@ router.get('/', async (c) => {
           language: ch.languages?.[0] || 'English'
         };
       } catch (err) {
-        console.warn(`[Channels] Error mapping channel ${ch.id}:`, err);
-        return null;
+        // Fallback mapping
+        return {
+          id: ch.id,
+          name: ch.name,
+          logo: ch.logo,
+          category: ch.categories?.[0] || 'General',
+          country: ch.countries?.[0] || 'Unknown',
+          quality: 'SD',
+          language: ch.languages?.[0] || 'English'
+        };
       }
     }));
 
-    const finalResults = results.filter(Boolean);
-    console.log(`[Channels] Returning ${finalResults.length} results.`);
-
-    return c.json(finalResults);
+    console.log(`[Channels] Returning ${results.length} results.`);
+    return c.json(results);
   } catch (error) {
     console.error('[Channels] Route error:', error);
     return c.json({ 

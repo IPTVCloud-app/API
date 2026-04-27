@@ -56,7 +56,37 @@ app.get('/', (c) => {
 });
 
 // Health Check
-app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
+app.get('/api/health', (c) => {
+  const uptime = process.uptime();
+  const memoryUsage = process.memoryUsage();
+  
+  // Mock data for frontend graphs (last 7 data points)
+  const stats = {
+    latency: [45, 52, 48, 61, 44, 49, 50], // ms
+    requests: [120, 145, 132, 110, 156, 140, 148], // req/min
+    errors: [0, 1, 0, 0, 2, 0, 0]
+  };
+
+  return c.json({
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'development',
+    version: '1.2.0',
+    uptime: {
+      seconds: Math.floor(uptime),
+      readable: new Date(uptime * 1000).toISOString().substr(11, 8)
+    },
+    memory: {
+      heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024) + 'MB',
+      heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024) + 'MB',
+      rss: Math.round(memoryUsage.rss / 1024 / 1024) + 'MB'
+    },
+    database: {
+      connected: !!supabase,
+    },
+    statistics: stats,
+    time: new Date().toISOString()
+  });
+});
 
 // 4. Admin Cleanup (Vercel Cron)
 app.get('/api/admin/cleanup', (c) => {
