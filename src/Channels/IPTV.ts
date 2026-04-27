@@ -9,6 +9,10 @@ const BASE_URL = 'https://iptv-org.github.io/api';
 const caches: Record<string, { data: any, lastLoad: number }> = {};
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
+// Status cache for streams (URL -> { status: string, time: number })
+const statusCache = new Map<string, { status: string, time: number }>();
+const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
+
 async function getCachedData(endpoint: string) {
   const now = Date.now();
   if (caches[endpoint] && (now - caches[endpoint].lastLoad) < CACHE_TTL) {
@@ -28,6 +32,40 @@ async function getCachedData(endpoint: string) {
 }
 
 /**
+ * Check if a stream is online
+ */
+async function checkStreamStatus(url: string): Promise<string> {
+  if (!url) return 'offline';
+  
+  const cached = statusCache.get(url);
+  if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
+
+  try {
+    const res = await axios.head(url, { 
+      timeout: 1500, 
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+    const status = res.status < 400 ? 'online' : 'offline';
+    statusCache.set(url, { status, time: Date.now() });
+    return status;
+  } catch (err) {
+    try {
+      await axios.get(url, { 
+        timeout: 1500, 
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+        validateStatus: (status) => status >= 200 && status < 400
+      });
+      statusCache.set(url, { status: 'online', time: Date.now() });
+      return 'online';
+    } catch (e) {
+      statusCache.set(url, { status: 'offline', time: Date.now() });
+      return 'offline';
+    }
+  }
+}
+
+/**
  * All API Handlers from iptv-org
  */
 
@@ -41,16 +79,36 @@ router.get('/timezones', async (c) => c.json(await getCachedData('timezones')));
 router.get('/blocklist', async (c) => c.json(await getCachedData('blocklist')));
 router.get('/feeds', async (c) => c.json(await getCachedData('feeds')));
 router.get('/logos', async (c) => c.json(await getCachedData('logos')));
+
 router.get('/streams', async (c) => {
-  const limit = parseInt(c.req.query('limit') || '100', 10);
-  const data = await getCachedData('streams');
-  return c.json(data.slice(0, limit));
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 50); // Hard limit for stability
+  const offset = parseInt(c.req.query('offset') || '0', 10);
+  
+  try {
+    const data = await getCachedData('streams');
+    const slice = data.slice(offset, offset + limit);
+
+    // Perform parallel status detection
+    const results = await Promise.all(slice.map(async (s: any) => {
+      const status = await checkStreamStatus(s.url);
+      return {
+        ...s,
+        status: status
+      };
+    }));
+
+    return c.json(results);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch streams' }, 500);
+  }
 });
+
 router.get('/channels', async (c) => {
   const limit = parseInt(c.req.query('limit') || '100', 10);
   const data = await getCachedData('channels');
   return c.json(data.slice(0, limit));
 });
+
 router.get('/guides', async (c) => {
   const limit = parseInt(c.req.query('limit') || '100', 10);
   const data = await getCachedData('guides');

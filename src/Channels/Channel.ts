@@ -21,6 +21,10 @@ let metadataMaps: any = null;
 let lastIndexLoad = 0;
 const INDEX_TTL = 1000 * 60 * 60; // 1 hour
 
+// Status cache (URL -> { status: string, time: number })
+const statusCache = new Map<string, { status: string, time: number }>();
+const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
+
 /**
  * Build Metadata Lookups
  */
@@ -60,7 +64,41 @@ async function getMetadataMaps() {
 }
 
 /**
- * Quality Weighting for Sorting
+ * Check if a stream is online
+ */
+async function checkStreamStatus(url: string): Promise<string> {
+  if (!url) return 'offline';
+  
+  const cached = statusCache.get(url);
+  if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
+
+  try {
+    const res = await axios.head(url, { 
+      timeout: 1500, 
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+    const status = res.status < 400 ? 'online' : 'offline';
+    statusCache.set(url, { status, time: Date.now() });
+    return status;
+  } catch (err) {
+    try {
+      await axios.get(url, { 
+        timeout: 1500, 
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+        validateStatus: (status) => status >= 200 && status < 400
+      });
+      statusCache.set(url, { status: 'online', time: Date.now() });
+      return 'online';
+    } catch (e) {
+      statusCache.set(url, { status: 'offline', time: Date.now() });
+      return 'offline';
+    }
+  }
+}
+
+/**
+ * Quality Weighting
  */
 const QUALITY_WEIGHTS: Record<string, number> = {
   '1080p': 100,
@@ -73,6 +111,10 @@ const QUALITY_WEIGHTS: Record<string, number> = {
 function getQualityWeight(q: string): number {
   if (q.includes('4k') || q.includes('2160p')) return 1000;
   return QUALITY_WEIGHTS[q] || 10;
+}
+
+function isQualityTooHigh(quality: string): boolean {
+  return getQualityWeight(quality) > 100;
 }
 
 /**
@@ -99,7 +141,6 @@ async function getStreamIndex() {
       newIndex.set(s.channel, list);
     });
     
-    // Sort all stream lists by quality descending
     for (const [id, streams] of newIndex.entries()) {
       newIndex.set(id, streams.sort((a, b) => getQualityWeight(b.quality) - getQualityWeight(a.quality)));
     }
@@ -112,24 +153,33 @@ async function getStreamIndex() {
   }
 }
 
+interface FilterOptions {
+  country?: string;
+  category?: string;
+  language?: string;
+  region?: string;
+  nsfw?: boolean;
+  network?: string;
+  geo_blocked?: boolean;
+  is_active?: boolean;
+  subdivision?: string;
+  owner?: string;
+}
+
 /**
- * Manual Streaming JSON Parser (Early Exit)
+ * Manual Streaming JSON Parser (Search + Filters + Segmented)
  */
-async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: string) {
+async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: string, search?: string, filters: FilterOptions = {}) {
   const streams = await getStreamIndex();
   const meta = await getMetadataMaps();
+  const searchLower = search?.toLowerCase();
   
-  const response = await axios({
-    method: 'get',
-    url: CHANNELS_URL,
-    responseType: 'stream'
-  });
-
+  const response = await axios({ method: 'get', url: CHANNELS_URL, responseType: 'stream' });
   const stream = response.data as Readable;
   const results: any[] = [];
   let currentObject = '';
   let bracketDepth = 0;
-  let objectsSkipped = 0;
+  let matchesFound = 0;
   let inString = false;
   let isEscaped = false;
 
@@ -154,18 +204,42 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
           bracketDepth--;
           currentObject += char;
           if (bracketDepth === 0) {
-            if (objectsSkipped < offset) {
-              objectsSkipped++;
-            } else {
-              try {
-                const ch = JSON.parse(currentObject);
-                const countryInfo = meta.countries.get(ch.country);
-                const chStreams = streams.get(ch.id) || [];
-                
-                // Identify "Highest allowed" (Cap at 1080p)
-                const allowedStreams = chStreams.filter(s => getQualityWeight(s.quality) <= 100);
-                const highestQuality = allowedStreams.length > 0 ? allowedStreams[0].quality : 'N/A';
+            try {
+              const ch = JSON.parse(currentObject);
+              const countryInfo = meta.countries.get(ch.country);
+              const chStreams = streams.get(ch.id) || [];
+              const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
 
+              // 1. Apply Search Filter
+              const matchesSearch = !searchLower || 
+                ch.name?.toLowerCase().includes(searchLower) || 
+                ch.id?.toLowerCase().includes(searchLower) ||
+                ch.country?.toLowerCase().includes(searchLower) ||
+                ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower));
+
+              if (!matchesSearch) continue;
+
+              // 2. Apply Filters
+              if (filters.country && ch.country !== filters.country) continue;
+              if (filters.category && !ch.categories?.includes(filters.category)) continue;
+              if (filters.language && !ch.languages?.includes(filters.language)) continue;
+              if (filters.region && countryInfo?.region !== filters.region) continue;
+              if (filters.nsfw !== undefined && ch.is_nsfw !== filters.nsfw) continue;
+              if (filters.network && ch.network?.toLowerCase() !== filters.network.toLowerCase()) continue;
+              if (filters.geo_blocked !== undefined && isGeoBlocked !== filters.geo_blocked) continue;
+              if (filters.is_active !== undefined) {
+                const isActive = !ch.closed;
+                if (isActive !== filters.is_active) continue;
+              }
+              if (filters.subdivision && ch.subdivision !== filters.subdivision) continue;
+              if (filters.owner && !ch.owners?.some((o: string) => o.toLowerCase() === filters.owner?.toLowerCase())) continue;
+
+              // If we reached here, it's a full match
+              if (matchesFound < offset) {
+                matchesFound++;
+              } else {
+                const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+                
                 results.push({
                   id: ch.id,
                   name: ch.name,
@@ -189,9 +263,10 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
                   is_nsfw: ch.is_nsfw,
                   logo: ch.logo,
                   format: ch.format || null,
-                  geo_blocked: chStreams.some(s => s.label?.toLowerCase().includes('geo-blocked')),
-                  highest_allowed_quality: highestQuality,
-                  available_streams: allowedStreams.length
+                  geo_blocked: isGeoBlocked,
+                  highest_allowed_quality: allowedStreams.length > 0 ? allowedStreams[0].quality : 'N/A',
+                  available_streams: allowedStreams.length,
+                  primary_stream_url: allowedStreams.length > 0 ? allowedStreams[0].url : null
                 });
                 
                 if (results.length >= limit) {
@@ -199,8 +274,8 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
                   resolve(results);
                   return;
                 }
-              } catch (e) {}
-            }
+              }
+            } catch (e) {}
           }
         } else if (bracketDepth > 0) {
           currentObject += char;
@@ -218,83 +293,46 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
   const resolution = c.req.query('res');
-  
   if (!shortId) return c.json({ error: 'ID required' }, 400);
 
   try {
     const originalId = await getOriginalId(shortId);
     const streams = await getStreamIndex();
     const chStreams = streams.get(originalId || shortId) || [];
+    const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
 
-    // Filter to only allow 1080p and lower
-    const allowedStreams = chStreams.filter(s => getQualityWeight(s.quality) <= 100);
+    if (allowedStreams.length === 0) return c.json({ error: 'No supported streams found' }, 404);
 
-    if (allowedStreams.length === 0) {
-      return c.json({ 
-        code: 403, 
-        message: 'No supported streams (max 1080p) available for this channel.' 
-      }, 403);
-    }
+    const highestAvailable = allowedStreams[0];
 
-    const highestAvailable = allowedStreams[0]; // Already sorted descending
-
-    // 1. If resolution requested, validate and proxy
     if (resolution) {
       if (getQualityWeight(resolution) > getQualityWeight(highestAvailable.quality)) {
-        return c.json({ 
-          code: 403, 
-          message: `Requested resolution ${resolution} is higher than the original stream (${highestAvailable.quality}).` 
-        }, 403);
+        return c.json({ code: 403, message: `Resolution ${resolution} exceeds the original stream limit (${highestAvailable.quality}).` }, 403);
       }
-
-      const selected = allowedStreams.find(s => s.quality === resolution) || highestAvailable;
-      const streamUrl = selected.url;
-      const userAgent = selected.user_agent || 'Mozilla/5.0';
-      
-      const response = await axios.get(streamUrl, {
-        responseType: 'text',
-        headers: { 'User-Agent': userAgent }
-      });
-
+      const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
+      const response = await axios.get(selected.url, { responseType: 'text', headers: { 'User-Agent': selected.user_agent || 'Mozilla/5.0' } });
       let content = response.data;
-      const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
+      const baseUrl = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
       const rewrittenLines = content.split('\n').map((line: string) => {
         const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http')) {
-          return new URL(trimmed, baseUrl).href;
-        }
+        if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http')) return new URL(trimmed, baseUrl).href;
         return line;
       });
-
-      return c.body(rewrittenLines.join('\n'), 200, {
-        'Content-Type': 'application/x-mpegURL',
-        'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': '*'
-      });
+      return c.body(rewrittenLines.join('\n'), 200, { 'Content-Type': 'application/x-mpegURL', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
     }
 
-    // 2. Return ABR Master M3U8 (Highest detected and lower only)
     let masterM3U8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
-    allowedStreams.forEach(s => {
+    allowedStreams.forEach((s: any) => {
       let bandwidth = 800000;
       let resText = '640x480';
-      
       if (s.quality === '1080p') { bandwidth = 5000000; resText = '1920x1080'; }
       else if (s.quality === '720p') { bandwidth = 2800000; resText = '1280x720'; }
       else if (s.quality === '480p') { bandwidth = 1200000; resText = '854x480'; }
-      
       masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resText},NAME="${s.quality}"\n`;
       masterM3U8 += `/api/channels/stream?id=${shortId}&res=${s.quality}\n`;
     });
-
-    return c.body(masterM3U8, 200, {
-      'Content-Type': 'application/x-mpegURL',
-      'Cache-Control': 'no-cache'
-    });
-
-  } catch (error) {
-    return c.json({ error: 'Stream controller error' }, 500);
-  }
+    return c.body(masterM3U8, 200, { 'Content-Type': 'application/x-mpegURL', 'Cache-Control': 'no-cache' });
+  } catch (error) { return c.json({ error: 'Stream controller error' }, 500); }
 });
 
 export async function getShortId(originalId: string): Promise<string> {
@@ -315,32 +353,58 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
 }
 
 router.get('/', async (c) => {
-  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 500);
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 50);
   const offset = parseInt(c.req.query('offset') || '0', 10);
+  const search = c.req.query('search');
+  const statusFilter = c.req.query('status'); // 'online' | 'offline'
+
+  // Extract Filters
+  const filters: FilterOptions = {
+    country: c.req.query('country'),
+    category: c.req.query('category'),
+    language: c.req.query('language'),
+    region: c.req.query('region'),
+    nsfw: c.req.query('nsfw') === 'true' ? true : (c.req.query('nsfw') === 'false' ? false : undefined),
+    network: c.req.query('network'),
+    geo_blocked: c.req.query('geo_blocked') === 'true' ? true : (c.req.query('geo_blocked') === 'false' ? false : undefined),
+    is_active: c.req.query('is_active') === 'true' ? true : (c.req.query('is_active') === 'false' ? false : undefined),
+    subdivision: c.req.query('subdivision'),
+    owner: c.req.query('owner')
+  };
+
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const host = c.req.header('host');
   const baseUrl = `${protocol}://${host}`;
-  
-  try {
-    const enrichedSlice = await fetchChannelsSegmented(offset, limit, baseUrl);
-    const results = await Promise.all(enrichedSlice.map(async (ch: any) => {
-      const shortId = await getShortId(ch.id);
-      return {
-        ...ch,
-        id: shortId,
-        original_id: ch.id,
-        stream: `${baseUrl}/api/channels/stream?id=${shortId}`
-      };
-    }));
-    return c.json(results);
-  } catch (error: any) {
-    return c.json({ code: 500, message: 'Streaming error', detail: error.message }, 500);
-  }
-});
 
-router.get('/:id', async (c) => {
-  const id = c.req.param('id');
-  return c.redirect(`/api/channels/stream?id=${id}`);
+  try {
+    // If status filter is applied, we might need to scan more than 'limit' items
+    const scanLimit = statusFilter ? limit * 2 : limit;
+    const enrichedSlice = await fetchChannelsSegmented(offset, scanLimit, baseUrl, search, filters);
+
+    const resultsWithStatus = await Promise.all(enrichedSlice.map(async (ch: any) => {
+      const shortId = await getShortId(ch.id);
+      const status = await checkStreamStatus(ch.primary_stream_url);
+
+      const item = { 
+        ...ch, 
+        id: shortId, 
+        original_id: ch.id, 
+        stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
+        status: status 
+      };
+      delete (item as any).primary_stream_url;
+      return item;
+    }));
+
+    // Apply Status Filter
+    let finalResults = resultsWithStatus;
+    if (statusFilter === 'online' || statusFilter === 'offline') {
+      finalResults = resultsWithStatus.filter(res => res.status === statusFilter);
+    }
+
+    // Slice to the requested limit
+    return c.json(finalResults.slice(0, limit));
+  } catch (error: any) { return c.json({ code: 500, message: 'Streaming error', detail: error.message }, 500); }
 });
 
 export default router;
