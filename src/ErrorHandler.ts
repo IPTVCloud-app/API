@@ -8,11 +8,16 @@ import { HTTPException } from 'hono/http-exception';
 export const errorHandler = (err: Error, c: Context) => {
   console.error(`[Error] ${c.req.method} ${c.req.url}:`, err);
 
+  const requestId = c.req.header('x-vercel-id') || c.req.header('x-request-id') || 'internal';
+  const url = c.req.url;
+
   if (err instanceof HTTPException) {
     return c.json(
       {
-        error: err.message || 'An HTTP error occurred',
-        status: err.status,
+        code: err.status,
+        message: err.message || 'An HTTP error occurred',
+        request_id: requestId,
+        url: url
       },
       err.status
     );
@@ -21,26 +26,33 @@ export const errorHandler = (err: Error, c: Context) => {
   // Handle common runtime errors (like null database client)
   if (err.message?.includes('null') && err.message?.includes('supabase')) {
     return c.json({
-      error: 'Database connection is not configured correctly.',
-      status: 503
+      code: 503,
+      message: 'Database connection is not configured correctly.',
+      request_id: requestId,
+      url: url
     }, 503);
   }
 
   // Handle generic errors
   return c.json(
     {
-      error: err.message || 'Internal Server Error',
-      status: 500,
+      code: 500,
+      message: err.message || 'Internal Server Error',
+      request_id: requestId,
+      url: url
     },
     500
   );
 };
 
 export const notFoundHandler = (c: Context) => {
+  const requestId = c.req.header('x-vercel-id') || c.req.header('x-request-id') || 'internal';
   return c.json(
     {
-      error: `Route not found: ${c.req.method} ${c.req.url}`,
-      status: 404,
+      code: 404,
+      message: 'Not found.',
+      request_id: requestId,
+      url: c.req.url
     },
     404
   );

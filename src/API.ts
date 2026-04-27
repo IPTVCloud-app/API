@@ -26,16 +26,15 @@ import { errorHandler, notFoundHandler } from './ErrorHandler.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { Readable } from 'stream';
 
 const app = new Hono();
 
 // 1. Global Middleware
 app.use('*', logger());
-// app.use('*', cors()); // Temporarily disabled to isolate adapter issues
+app.use('*', cors()); 
 
 // 2. Universal Rate Limiting
-// Temporarily disabled to isolate adapter issues
-/*
 const globalLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
   limit: 100,
@@ -49,11 +48,11 @@ const globalLimiter = rateLimiter({
   },
 });
 app.use('*', globalLimiter);
-*/
 
 // 3. Root Redirect
 app.get('/', (c) => {
-  return c.text('API is online');
+  const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
+  return c.redirect(frontendUrl);
 });
 
 // Health Check
@@ -102,10 +101,22 @@ app.notFound(notFoundHandler);
 
 // Vercel Handler refactored for direct Node.js compatibility
 export default async function handler(req: any, res: any) {
-  console.log(`[Vercel] Handling ${req.method} ${req.url}`);
+  const protocol = req.headers['x-forwarded-proto'] || 'http';
+  const host = req.headers.host;
+  
+  // req.url in Node includes the query string (e.g. /path?id=123)
+  const fullUrl = `${protocol}://${host}${req.url}`;
+  
+  console.log(`[Vercel] Handling ${req.method} ${fullUrl}`);
+  
   try {
-    const result = await app.fetch(req);
-    const body = await result.text();
+    const result = await app.fetch(new Request(fullUrl, {
+      method: req.method,
+      headers: req.headers,
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
+      // @ts-ignore - duplex: 'half' is required for streaming bodies in some environments
+      duplex: 'half'
+    }));
     
     // Set status
     res.statusCode = result.status;
@@ -115,12 +126,27 @@ export default async function handler(req: any, res: any) {
       res.setHeader(key, value);
     });
 
-    console.log(`[Vercel] Response ready: ${result.status}`);
-    return res.end(body);
+    if (result.body) {
+      // Use streaming for better performance and support for binary data (thumbnails)
+      Readable.fromWeb(result.body as any).pipe(res);
+    } else {
+      res.end();
+    }
+
+    console.log(`[Vercel] Response sent: ${result.status}`);
   } catch (err: any) {
     console.error('[Vercel] Fatal error:', err);
     res.statusCode = 500;
-    return res.end(JSON.stringify({ error: 'Fatal Server Error', message: err.message }));
+    if (!res.headersSent) {
+      res.setHeader('Content-Type', 'application/json');
+      const requestId = req.headers['x-vercel-id'] || req.headers['x-request-id'] || 'internal';
+      res.end(JSON.stringify({ 
+        code: 500, 
+        message: 'Fatal Server Error', 
+        request_id: requestId,
+        url: fullUrl 
+      }));
+    }
   }
 }
 
