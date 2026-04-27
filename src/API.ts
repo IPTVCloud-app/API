@@ -23,6 +23,7 @@ import comments from './Channels/Comments.js';
 
 // Core Imports
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
+import { supabase } from './Database/DB.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
