@@ -18,6 +18,14 @@ export const errorHandler = (err: Error, c: Context) => {
     );
   }
 
+  // Handle common runtime errors (like null database client)
+  if (err.message?.includes('null') && err.message?.includes('supabase')) {
+    return c.json({
+      error: 'Database connection is not configured correctly.',
+      status: 503
+    }, 503);
+  }
+
   // Handle generic errors
   return c.json(
     {
