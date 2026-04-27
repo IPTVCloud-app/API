@@ -23,29 +23,11 @@ import comments from './Channels/Comments.js';
 
 // Core Imports
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
-import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
 const app = new Hono();
-
-// Daily Cleanup Cron (00:00)
-cron.schedule('0 0 * * *', () => {
-  console.log('🧹 Running daily thumbnail cleanup...');
-  const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
-  if (fs.existsSync(tempDir)) {
-    const files = fs.readdirSync(tempDir);
-    const now = Date.now();
-    files.forEach(file => {
-      const filePath = path.join(tempDir, file);
-      const stats = fs.statSync(filePath);
-      if (now - stats.mtimeMs > 24 * 60 * 60 * 1000) {
-        fs.unlinkSync(filePath);
-      }
-    });
-  }
-});
 
 // 1. Global Middleware
 app.use('*', logger());
@@ -67,11 +49,32 @@ app.use('*', globalLimiter);
 
 // 3. Root Redirect
 app.get('/', (c) => {
-  const frontendUrl = process.env.FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
+  const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
   return c.redirect(frontendUrl);
 });
 
-// 4. Routes registration
+// 4. Admin Cleanup (Vercel Cron)
+app.get('/api/admin/cleanup', (c) => {
+  console.log('🧹 Running daily thumbnail cleanup...');
+  const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
+  if (fs.existsSync(tempDir)) {
+    const files = fs.readdirSync(tempDir);
+    const now = Date.now();
+    let count = 0;
+    files.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      const stats = fs.statSync(filePath);
+      if (now - stats.mtimeMs > 24 * 60 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+        count++;
+      }
+    });
+    return c.json({ message: `Cleanup complete. Deleted ${count} files.` });
+  }
+  return c.json({ message: 'No cleanup needed.' });
+});
+
+// 5. Routes registration
 app.route('/auth/signup', signUp);
 app.route('/auth/signin', signIn);
 app.route('/auth/forgot-password', forgotPassword);

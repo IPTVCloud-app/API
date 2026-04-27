@@ -17,65 +17,39 @@ if (!fs.existsSync(TEMP_DIR)) {
 }
 
 /**
- * Capture Sharpest Frame from M3U8
- * Captures frames at 2s, 6s, and 12s. Picks the one with the largest file size (most detail/entropy).
+ * Capture Frame from M3U8
+ * Captures a single frame at the 2-second mark to optimize speed.
  */
 async function captureSharpestFrame(streamUrl: string, outputPath: string, shortId: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const tempPrefix = `raw-${shortId}`;
+    const tempFile = path.join(TEMP_DIR, `raw-${shortId}.jpg`);
     
-    // We will extract 3 frames at specific timestamps
     ffmpeg(streamUrl)
       .on('end', async () => {
         try {
-          // Find the largest file among the captured frames
-          const frames = [1, 2, 3].map(i => path.join(TEMP_DIR, `${tempPrefix}_${i}.jpg`));
-          
-          let largestFile = '';
-          let maxSize = -1;
-
-          for (const frame of frames) {
-            if (fs.existsSync(frame)) {
-              const stats = fs.statSync(frame);
-              if (stats.size > maxSize) {
-                maxSize = stats.size;
-                largestFile = frame;
-              }
-            }
+          if (!fs.existsSync(tempFile)) {
+            throw new Error('Failed to capture frame');
           }
 
-          if (!largestFile || maxSize === -1) {
-            throw new Error('Failed to capture any valid frames');
-          }
-
-          // Compress the winning frame with Sharp
-          await sharp(largestFile)
-            .webp({ quality: 85 }) // High quality WebP
+          // Compress with Sharp
+          await sharp(tempFile)
+            .webp({ quality: 85 })
             .toFile(outputPath);
           
-          // Cleanup all raw frames
-          for (const frame of frames) {
-            if (fs.existsSync(frame)) {
-              fs.unlinkSync(frame);
-            }
-          }
-
+          // Cleanup
+          fs.unlinkSync(tempFile);
           resolve();
         } catch (err) {
           reject(err);
         }
       })
       .on('error', (err: Error) => {
-        // Also attempt to cleanup on error
-        [1, 2, 3].forEach(i => {
-           const f = path.join(TEMP_DIR, `${tempPrefix}_${i}.jpg`);
-           if (fs.existsSync(f)) fs.unlinkSync(f);
-        });
+        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
         reject(err);
       })
       .screenshots({
-        timestamps: [2, 6, 12],
-        filename: `${tempPrefix}_%i.jpg`,
+        timestamps: [2],
+        filename: `raw-${shortId}.jpg`,
         folder: TEMP_DIR
       });
   });

@@ -30,7 +30,7 @@ router.post('/', zValidator('json', forgotPasswordSchema), async (c) => {
     }
 
     const code = await createOrUpdateOtp(email, 'reset');
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'http://localhost:3000';
     const resetLink = `${frontendUrl}/account/reset-password?email=${encodeURIComponent(email)}&token=${code}`;
 
     await sendPasswordResetEmail(email, resetLink);
