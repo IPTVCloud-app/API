@@ -33,7 +33,6 @@ async function getMetadataMaps() {
   if (metadataMaps && (now - lastIndexLoad) < INDEX_TTL) return metadataMaps;
 
   try {
-    console.log('[Metadata] Loading reference datasets...');
     const [cnt, lng, reg, tz] = await Promise.all([
       axios.get(COUNTRIES_URL).then(r => r.data),
       axios.get(LANGUAGES_URL).then(r => r.data),
@@ -41,11 +40,12 @@ async function getMetadataMaps() {
       axios.get(TIMEZONES_URL).then(r => r.data)
     ]);
 
+    // Map country code to list of timezone names (using 'code' field)
     const countryToTz = new Map<string, string[]>();
     tz.forEach((t: any) => {
       t.countries?.forEach((code: string) => {
         const list = countryToTz.get(code) || [];
-        list.push(t.name);
+        if (t.code) list.push(t.code);
         countryToTz.set(code, list);
       });
     });
@@ -68,7 +68,6 @@ async function getMetadataMaps() {
  */
 async function checkStreamStatus(url: string): Promise<string> {
   if (!url) return 'offline';
-  
   const cached = statusCache.get(url);
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
 
@@ -109,7 +108,9 @@ const QUALITY_WEIGHTS: Record<string, number> = {
 };
 
 function getQualityWeight(q: string): number {
-  if (q.includes('4k') || q.includes('2160p')) return 1000;
+  if (!q) return 0;
+  const lower = q.toLowerCase();
+  if (lower.includes('4k') || lower.includes('2160p')) return 1000;
   return QUALITY_WEIGHTS[q] || 10;
 }
 
@@ -124,33 +125,22 @@ async function getStreamIndex() {
   const now = Date.now();
   if (streamIndex && (now - lastIndexLoad) < INDEX_TTL) return streamIndex;
 
-  console.log('[Streaming] Building multi-stream index...');
   const newIndex = new Map<string, any[]>();
-  
   try {
     const response = await axios.get(STREAMS_URL);
     response.data.forEach((s: any) => {
       if (!s.channel) return;
       const list = newIndex.get(s.channel) || [];
-      list.push({ 
-        url: s.url, 
-        quality: s.quality || 'SD',
-        user_agent: s.user_agent || null,
-        label: s.label || null
-      });
+      list.push({ url: s.url, quality: s.quality || 'SD', user_agent: s.user_agent || null, label: s.label || null });
       newIndex.set(s.channel, list);
     });
-    
     for (const [id, streams] of newIndex.entries()) {
       newIndex.set(id, streams.sort((a, b) => getQualityWeight(b.quality) - getQualityWeight(a.quality)));
     }
-
     streamIndex = newIndex;
     lastIndexLoad = now;
     return streamIndex;
-  } catch (err) {
-    return streamIndex || new Map();
-  }
+  } catch (err) { return streamIndex || new Map(); }
 }
 
 interface FilterOptions {
@@ -167,7 +157,7 @@ interface FilterOptions {
 }
 
 /**
- * Manual Streaming JSON Parser (Search + Filters + Segmented)
+ * Manual Streaming JSON Parser
  */
 async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: string, search?: string, filters: FilterOptions = {}) {
   const streams = await getStreamIndex();
@@ -175,7 +165,7 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
   const searchLower = search?.toLowerCase();
   
   const response = await axios({ method: 'get', url: CHANNELS_URL, responseType: 'stream' });
-  const stream = response.data as Readable;
+  const streamData = response.data as Readable;
   const results: any[] = [];
   let currentObject = '';
   let bracketDepth = 0;
@@ -184,7 +174,7 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
   let isEscaped = false;
 
   return new Promise<any[]>((resolve, reject) => {
-    stream.on('data', (chunk: Buffer) => {
+    streamData.on('data', (chunk: Buffer) => {
       const str = chunk.toString();
       for (let i = 0; i < str.length; i++) {
         const char = str[i];
@@ -210,7 +200,6 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               const chStreams = streams.get(ch.id) || [];
               const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
 
-              // 1. Apply Search Filter
               const matchesSearch = !searchLower || 
                 ch.name?.toLowerCase().includes(searchLower) || 
                 ch.id?.toLowerCase().includes(searchLower) ||
@@ -219,7 +208,6 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 
               if (!matchesSearch) continue;
 
-              // 2. Apply Filters
               if (filters.country && ch.country !== filters.country) continue;
               if (filters.category && !ch.categories?.includes(filters.category)) continue;
               if (filters.language && !ch.languages?.includes(filters.language)) continue;
@@ -227,53 +215,34 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               if (filters.nsfw !== undefined && ch.is_nsfw !== filters.nsfw) continue;
               if (filters.network && ch.network?.toLowerCase() !== filters.network.toLowerCase()) continue;
               if (filters.geo_blocked !== undefined && isGeoBlocked !== filters.geo_blocked) continue;
-              if (filters.is_active !== undefined) {
-                const isActive = !ch.closed;
-                if (isActive !== filters.is_active) continue;
-              }
+              if (filters.is_active !== undefined && (!!ch.closed !== !filters.is_active)) continue;
               if (filters.subdivision && ch.subdivision !== filters.subdivision) continue;
               if (filters.owner && !ch.owners?.some((o: string) => o.toLowerCase() === filters.owner?.toLowerCase())) continue;
 
-              // If we reached here, it's a full match
               if (matchesFound < offset) {
                 matchesFound++;
               } else {
                 const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
                 
+                // Construct clean object: Use data or null for empty
+                const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
+                const tzList = meta.timezones.get(ch.country) || [];
+
                 results.push({
-                  id: ch.id,
-                  name: ch.name,
-                  alt_names: ch.alt_names || [],
-                  network: ch.network,
-                  owners: ch.owners || [],
-                  country: ch.country,
-                  country_name: countryInfo?.name || ch.country,
+                  ...ch,
+                  country_name: countryInfo?.name || null,
                   region: countryInfo?.region || null,
                   city: ch.city || null,
                   subdivision: ch.subdivision || null,
-                  broadcast_area: ch.broadcast_area || [],
-                  languages: ch.languages || [],
-                  languages_names: ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [],
-                  categories: ch.categories || [],
-                  timezones: meta.timezones.get(ch.country) || [],
-                  website: ch.website,
-                  launched: ch.launched,
-                  closed: ch.closed,
-                  replaced_by: ch.replaced_by,
-                  is_nsfw: ch.is_nsfw,
-                  logo: ch.logo,
-                  format: ch.format || null,
+                  timezones: tzList.length > 0 ? tzList : null,
+                  languages_names: langNames.length > 0 ? langNames : null,
                   geo_blocked: isGeoBlocked,
-                  highest_allowed_quality: allowedStreams.length > 0 ? allowedStreams[0].quality : 'N/A',
+                  highest_allowed_quality: allowedStreams.length > 0 ? allowedStreams[0].quality : null,
                   available_streams: allowedStreams.length,
                   primary_stream_url: allowedStreams.length > 0 ? allowedStreams[0].url : null
                 });
                 
-                if (results.length >= limit) {
-                  stream.destroy();
-                  resolve(results);
-                  return;
-                }
+                if (results.length >= limit) { streamData.destroy(); resolve(results); return; }
               }
             } catch (e) {}
           }
@@ -282,17 +251,21 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
         }
       }
     });
-    stream.on('end', () => resolve(results));
-    stream.on('error', (err) => reject(err));
+    streamData.on('end', () => resolve(results));
+    streamData.on('error', (err) => reject(err));
   });
 }
 
 /**
- * ABR Stream Controller (Strict <= 1080p)
+ * ABR Stream Controller
  */
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
   const resolution = c.req.query('res');
+  const protocol = c.req.header('x-forwarded-proto') || 'http';
+  const host = c.req.header('host');
+  const baseUrl = `${protocol}://${host}`;
+  
   if (!shortId) return c.json({ error: 'ID required' }, 400);
 
   try {
@@ -305,22 +278,65 @@ router.get('/stream', async (c) => {
 
     const highestAvailable = allowedStreams[0];
 
+    // 1. Browser Detection
+    const acceptHeader = c.req.header('accept') || '';
+    if (!resolution && acceptHeader.includes('text/html')) {
+      const playerUrl = `${baseUrl}/api/channels/stream?id=${shortId}`;
+      return c.html(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>IPTVCloud Player</title>
+          <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+          <style>
+            body { margin: 0; background: #000; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+            video { width: 100%; height: 100%; max-width: 100vw; max-height: 100vh; }
+            .info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px 10px; border-radius: 5px; pointer-events: none; }
+          </style>
+        </head>
+        <body>
+          <div class="info">Playing: ${shortId} (${highestAvailable.quality})</div>
+          <video id="video" controls autoplay playsinline></video>
+          <script>
+            var video = document.getElementById('video');
+            var streamUrl = '${playerUrl}';
+            if (Hls.isSupported()) {
+              var hls = new Hls();
+              hls.loadSource(streamUrl);
+              hls.attachMedia(video);
+              hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play(); });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+              video.src = streamUrl;
+              video.addEventListener('loadedmetadata', function() { video.play(); });
+            }
+          </script>
+        </body>
+        </html>
+      `);
+    }
+
+    // 2. Specific Resolution Proxy
     if (resolution) {
       if (getQualityWeight(resolution) > getQualityWeight(highestAvailable.quality)) {
-        return c.json({ code: 403, message: `Resolution ${resolution} exceeds the original stream limit (${highestAvailable.quality}).` }, 403);
+        return c.json({ code: 403, message: `Quality limit exceeded.` }, 403);
       }
       const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
       const response = await axios.get(selected.url, { responseType: 'text', headers: { 'User-Agent': selected.user_agent || 'Mozilla/5.0' } });
       let content = response.data;
-      const baseUrl = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
+      const streamBase = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
       const rewrittenLines = content.split('\n').map((line: string) => {
         const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http')) return new URL(trimmed, baseUrl).href;
+        if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http')) return new URL(trimmed, streamBase).href;
         return line;
       });
-      return c.body(rewrittenLines.join('\n'), 200, { 'Content-Type': 'application/x-mpegURL', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+      return c.body(rewrittenLines.join('\n'), 200, { 
+        'Content-Type': 'application/vnd.apple.mpegurl', 
+        'Cache-Control': 'no-cache', 
+        'Access-Control-Allow-Origin': '*' 
+      });
     }
 
+    // 3. Master M3U8 for ABR
     let masterM3U8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
     allowedStreams.forEach((s: any) => {
       let bandwidth = 800000;
@@ -329,9 +345,14 @@ router.get('/stream', async (c) => {
       else if (s.quality === '720p') { bandwidth = 2800000; resText = '1280x720'; }
       else if (s.quality === '480p') { bandwidth = 1200000; resText = '854x480'; }
       masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resText},NAME="${s.quality}"\n`;
-      masterM3U8 += `/api/channels/stream?id=${shortId}&res=${s.quality}\n`;
+      masterM3U8 += `${baseUrl}/api/channels/stream?id=${shortId}&res=${s.quality}\n`;
     });
-    return c.body(masterM3U8, 200, { 'Content-Type': 'application/x-mpegURL', 'Cache-Control': 'no-cache' });
+
+    return c.body(masterM3U8, 200, { 
+      'Content-Type': 'application/vnd.apple.mpegurl', 
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*'
+    });
   } catch (error) { return c.json({ error: 'Stream controller error' }, 500); }
 });
 
@@ -356,9 +377,8 @@ router.get('/', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 50);
   const offset = parseInt(c.req.query('offset') || '0', 10);
   const search = c.req.query('search');
-  const statusFilter = c.req.query('status'); // 'online' | 'offline'
-
-  // Extract Filters
+  const statusFilter = c.req.query('status');
+  
   const filters: FilterOptions = {
     country: c.req.query('country'),
     category: c.req.query('category'),
@@ -375,16 +395,13 @@ router.get('/', async (c) => {
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const host = c.req.header('host');
   const baseUrl = `${protocol}://${host}`;
-
+  
   try {
-    // If status filter is applied, we might need to scan more than 'limit' items
     const scanLimit = statusFilter ? limit * 2 : limit;
     const enrichedSlice = await fetchChannelsSegmented(offset, scanLimit, baseUrl, search, filters);
-
     const resultsWithStatus = await Promise.all(enrichedSlice.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
       const status = await checkStreamStatus(ch.primary_stream_url);
-
       const item = { 
         ...ch, 
         id: shortId, 
@@ -395,16 +412,17 @@ router.get('/', async (c) => {
       delete (item as any).primary_stream_url;
       return item;
     }));
-
-    // Apply Status Filter
     let finalResults = resultsWithStatus;
     if (statusFilter === 'online' || statusFilter === 'offline') {
       finalResults = resultsWithStatus.filter(res => res.status === statusFilter);
     }
-
-    // Slice to the requested limit
     return c.json(finalResults.slice(0, limit));
   } catch (error: any) { return c.json({ code: 500, message: 'Streaming error', detail: error.message }, 500); }
+});
+
+router.get('/:id', async (c) => {
+  const id = c.req.param('id');
+  return c.redirect(`/api/channels/stream?id=${id}`);
 });
 
 export default router;
