@@ -31,15 +31,16 @@ const app = new Hono();
 
 // 1. Global Middleware
 app.use('*', logger());
-app.use('*', cors()); // Use default CORS for maximum compatibility with Vercel environment
+// app.use('*', cors()); // Temporarily disabled to isolate adapter issues
 
 // 2. Universal Rate Limiting
+// Temporarily disabled to isolate adapter issues
+/*
 const globalLimiter = rateLimiter({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  limit: 100, // 100 requests per IP per window
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
   standardHeaders: 'draft-6',
   keyGenerator: (c) => {
-    // Safely get header for Vercel/Node environment
     try {
       return c.req.header('x-forwarded-for') || c.req.header('remote-addr') || 'anonymous';
     } catch {
@@ -48,11 +49,11 @@ const globalLimiter = rateLimiter({
   },
 });
 app.use('*', globalLimiter);
+*/
 
 // 3. Root Redirect
 app.get('/', (c) => {
-  const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
-  return c.redirect(frontendUrl);
+  return c.text('API is online');
 });
 
 // Health Check
