@@ -12,8 +12,16 @@ const app = new Hono();
 // Middleware
 app.use('*', logger());
 app.use('*', cors({
-  origin: process.env.FRONTEND_URL || '*', // Restrict to frontend domain in production
+  origin: (origin) => {
+    const envOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [];
+    const defaultOrigins = ['https://iptvcloudapp.vercel.app', 'http://localhost:3000'];
+    const allowedOrigins = [...new Set([...envOrigins, ...defaultOrigins])];
+    
+    return allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
+  },
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }));
 
 // Rate Limiter for Auth
