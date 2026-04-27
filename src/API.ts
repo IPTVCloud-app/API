@@ -97,6 +97,13 @@ app.route('/api/admin/users', adminUsers);
 app.onError(errorHandler);
 app.notFound(notFoundHandler);
 
+// Vercel Exports
+export const GET = handle(app);
+export const POST = handle(app);
+export const PUT = handle(app);
+export const DELETE = handle(app);
+export const PATCH = handle(app);
+
 // Local Server logic
 if (process.env.NODE_ENV !== 'production') {
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
