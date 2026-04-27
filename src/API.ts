@@ -100,11 +100,33 @@ app.route('/api/admin/users', adminUsers);
 app.onError(errorHandler);
 app.notFound(notFoundHandler);
 
+// Vercel Handler refactored for direct Node.js compatibility
+export default async function handler(req: any, res: any) {
+  console.log(`[Vercel] Handling ${req.method} ${req.url}`);
+  try {
+    const result = await app.fetch(req);
+    const body = await result.text();
+    
+    // Set status
+    res.statusCode = result.status;
+    
+    // Copy headers safely
+    result.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+
+    console.log(`[Vercel] Response ready: ${result.status}`);
+    return res.end(body);
+  } catch (err: any) {
+    console.error('[Vercel] Fatal error:', err);
+    res.statusCode = 500;
+    return res.end(JSON.stringify({ error: 'Fatal Server Error', message: err.message }));
+  }
+}
+
 // Local Server logic
 if (process.env.NODE_ENV !== 'production') {
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
   console.log(`Server is running on port ${port}`);
   serve({ fetch: app.fetch, port });
 }
-
-export default handle(app);
