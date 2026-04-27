@@ -14,38 +14,54 @@ const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 export async function getClient() {
   const now = Date.now();
   if (!sdkClient || (now - lastLoad) > CACHE_TTL) {
-    sdkClient = new sdk.Client();
-    await sdkClient.load();
-    lastLoad = now;
+    console.log('[SDK] Initializing iptv-org/sdk client...');
+    try {
+      sdkClient = new sdk.Client();
+      await sdkClient.load();
+      lastLoad = now;
+      console.log('[SDK] Client loaded successfully.');
+    } catch (err) {
+      console.error('[SDK] Failed to load client:', err);
+      throw err;
+    }
   }
   return sdkClient;
 }
 
 export async function getShortId(originalId: string): Promise<string> {
-  const { data: existing } = await supabase
-    .from('channel_mappings')
-    .select('short_id')
-    .eq('original_id', originalId)
-    .single();
+  try {
+    const { data: existing } = await supabase
+      .from('channel_mappings')
+      .select('short_id')
+      .eq('original_id', originalId)
+      .single();
 
-  if (existing) return existing.short_id;
+    if (existing) return existing.short_id;
 
-  const shortId = nanoid(12);
-  await supabase
-    .from('channel_mappings')
-    .insert([{ original_id: originalId, short_id: shortId }]);
+    const shortId = nanoid(12);
+    await supabase
+      .from('channel_mappings')
+      .insert([{ original_id: originalId, short_id: shortId }]);
 
-  return shortId;
+    return shortId;
+  } catch (err) {
+    console.warn(`[DB] Error mapping ${originalId}, using original ID as fallback:`, err);
+    return originalId;
+  }
 }
 
 export async function getOriginalId(shortId: string): Promise<string | null> {
-  const { data: existing } = await supabase
-    .from('channel_mappings')
-    .select('original_id')
-    .eq('short_id', shortId)
-    .single();
+  try {
+    const { data: existing } = await supabase
+      .from('channel_mappings')
+      .select('original_id')
+      .eq('short_id', shortId)
+      .single();
 
-  return existing?.original_id || null;
+    return existing?.original_id || shortId; // Fallback to shortId if mapping doesn't exist
+  } catch (err) {
+    return shortId;
+  }
 }
 
 /**
@@ -53,38 +69,60 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
  */
 router.get('/', async (c) => {
   const limit = parseInt(c.req.query('limit') || '50', 10);
+  console.log(`[Channels] Fetching up to ${limit} channels...`);
   
   try {
     const client = await getClient();
     const data = client.getData();
     
+    if (!data || !data.channels) {
+      console.error('[Channels] No data returned from SDK.');
+      return c.json({ error: 'No channel data available' }, 500);
+    }
+
     const blockedIds = data.blocklist.all().map((b: any) => b.channel);
     const allChannels = data.channels.all();
+    console.log(`[Channels] Total channels found: ${allChannels.length}`);
+    
     const filtered = allChannels.filter((ch: any) => !blockedIds.includes(ch.id));
+    console.log(`[Channels] Filtered channels (excluding blocked): ${filtered.length}`);
     
     const slice = filtered.slice(0, limit);
     
     const results = await Promise.all(slice.map(async (ch: any) => {
-      const shortId = await getShortId(ch.id);
-      const chStreams = data.streams.filter((s: any) => s.channel === ch.id).all();
-      const qualities = chStreams.map((s: any) => s.quality).filter(Boolean);
-      const quality = qualities.length > 0 ? qualities[0] : 'SD';
+      try {
+        const shortId = await getShortId(ch.id);
+        const chStreams = data.streams.filter((s: any) => s.channel === ch.id).all();
+        const qualities = chStreams.map((s: any) => s.quality).filter(Boolean);
+        const quality = qualities.length > 0 ? qualities[0] : 'SD';
 
-      return {
-        id: shortId,
-        name: ch.name,
-        logo: ch.logo,
-        category: ch.categories?.[0] || 'General',
-        country: ch.countries?.[0] || 'Unknown',
-        quality: quality,
-        language: ch.languages?.[0] || 'English'
-      };
+        return {
+          id: shortId,
+          name: ch.name,
+          logo: ch.logo,
+          category: ch.categories?.[0] || 'General',
+          country: ch.countries?.[0] || 'Unknown',
+          quality: quality,
+          language: ch.languages?.[0] || 'English'
+        };
+      } catch (err) {
+        console.warn(`[Channels] Error mapping channel ${ch.id}:`, err);
+        return null;
+      }
     }));
 
-    return c.json(results);
+    const finalResults = results.filter(Boolean);
+    console.log(`[Channels] Returning ${finalResults.length} results.`);
+
+    return c.json(finalResults);
   } catch (error) {
-    console.error('Error fetching channels:', error);
-    return c.json({ error: 'Failed to fetch channels' }, 500);
+    console.error('[Channels] Route error:', error);
+    return c.json({ 
+      code: 500,
+      message: 'Failed to fetch channels', 
+      detail: (error as Error).message,
+      url: c.req.url
+    }, 500);
   }
 });
 
