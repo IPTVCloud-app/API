@@ -4,9 +4,29 @@ import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { getClient, getOriginalId } from './Channel.js';
+import axios from 'axios';
+import { getOriginalId } from './Channel.js';
 
 const router = new Hono();
+
+// Remote data sources from iptv-org (matching Channel.ts)
+const STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
+
+// Simple cache for streams
+let cachedStreams: any = null;
+let lastLoad = 0;
+const CACHE_TTL = 1000 * 60 * 60; // 1 hour
+
+async function fetchStreams() {
+  const now = Date.now();
+  if (cachedStreams && (now - lastLoad) < CACHE_TTL) {
+    return cachedStreams;
+  }
+  const res = await axios.get(STREAMS_URL);
+  cachedStreams = res.data;
+  lastLoad = now;
+  return cachedStreams;
+}
 
 // Use OS temp directory for caching
 const TEMP_DIR = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
@@ -84,9 +104,8 @@ router.get('/', async (c) => {
     const originalId = await getOriginalId(shortId);
     if (!originalId) return c.json({ error: 'Channel not found' }, 404);
 
-    const client = await getClient();
-    const data = client.getData();
-    const chStreams = data.streams.filter((s: any) => s.channel === originalId).all();
+    const streams = await fetchStreams();
+    const chStreams = streams.filter((s: any) => s.channel === originalId);
     
     if (chStreams.length === 0) return c.json({ error: 'No streams found' }, 404);
     

@@ -1,48 +1,134 @@
 import { Hono } from 'hono';
-import sdk from '@iptv-org/sdk';
 import { nanoid } from 'nanoid';
 import axios from 'axios';
 import { supabase } from '../Database/DB.js';
+import { Readable } from 'stream';
 
 const router = new Hono();
 
-// Cache for SDK data
-let sdkClient: any = null;
-let lastLoad = 0;
-const CACHE_TTL = 1000 * 60 * 60; // 1 hour
+const CHANNELS_URL = 'https://iptv-org.github.io/api/channels.json';
+const STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
 
-export async function getClient() {
+// Persistent cache for stream mapping (channelId -> streamUrl)
+let streamIndex: Map<string, string> | null = null;
+let lastIndexLoad = 0;
+const INDEX_TTL = 1000 * 60 * 60; // 1 hour
+
+/**
+ * Lightweight Streaming Indexer
+ * Only keeps channelId and URL in memory to save ~80% memory.
+ */
+async function getStreamIndex() {
   const now = Date.now();
+  if (streamIndex && (now - lastIndexLoad) < INDEX_TTL) return streamIndex;
+
+  console.log('[Streaming] Building lightweight stream index...');
+  const newIndex = new Map<string, string>();
   
-  // If we have a client and it's fresh, return it
-  if (sdkClient && (now - lastLoad) < CACHE_TTL) {
-    return sdkClient;
-  }
-
-  console.log('[SDK] Initializing iptv-org/sdk client (Load/Reload)...');
   try {
-    const newClient = new sdk.Client();
-    await newClient.load();
+    const response = await axios.get(STREAMS_URL);
+    // Discard everything except ID and URL to save memory
+    response.data.forEach((s: any) => {
+      if (!newIndex.has(s.channel)) newIndex.set(s.channel, s.url);
+    });
     
-    // Verify we actually got data
-    const testData = newClient.getData();
-    if (!testData || !testData.channels || testData.channels.all().length === 0) {
-      throw new Error('SDK loaded but no channels found in data.');
-    }
-
-    sdkClient = newClient;
-    lastLoad = Date.now();
-    console.log(`[SDK] Client loaded successfully. Found ${sdkClient.getData().channels.all().length} channels.`);
-    return sdkClient;
+    streamIndex = newIndex;
+    lastIndexLoad = now;
+    console.log(`[Streaming] Index built with ${streamIndex.size} streams.`);
+    return streamIndex;
   } catch (err) {
-    console.error('[SDK] Failed to load client:', err);
-    // If we have an old client, fallback to it rather than returning nothing
-    if (sdkClient) {
-      console.warn('[SDK] Falling back to expired cache due to load failure.');
-      return sdkClient;
-    }
-    throw err;
+    console.error('[Streaming] Failed to build index:', err);
+    return streamIndex || new Map();
   }
+}
+
+/**
+ * Manual Streaming JSON Parser (Early Exit)
+ * Processes a minified JSON array of objects chunk-by-chunk.
+ * Stops as soon as 'limit' is reached.
+ */
+async function fetchChannelsSegmented(offset: number, limit: number) {
+  console.log(`[Streaming] Grabbing piece: offset=${offset}, limit=${limit}`);
+  const streams = await getStreamIndex();
+  
+  const response = await axios({
+    method: 'get',
+    url: CHANNELS_URL,
+    responseType: 'stream'
+  });
+
+  const stream = response.data as Readable;
+  const results: any[] = [];
+  let currentObject = '';
+  let bracketDepth = 0;
+  let objectsSkipped = 0;
+  let inString = false;
+  let isEscaped = false;
+
+  return new Promise<any[]>((resolve, reject) => {
+    stream.on('data', (chunk: Buffer) => {
+      const str = chunk.toString();
+      
+      for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+
+        if (inString) {
+          currentObject += char;
+          if (isEscaped) {
+            isEscaped = false;
+          } else if (char === '\\') {
+            isEscaped = true;
+          } else if (char === '"') {
+            inString = false;
+          }
+          continue;
+        }
+
+        if (char === '"') {
+          inString = true;
+          currentObject += char;
+          continue;
+        }
+
+        if (char === '{') {
+          if (bracketDepth === 0) currentObject = '';
+          bracketDepth++;
+          currentObject += char;
+        } else if (char === '}') {
+          bracketDepth--;
+          currentObject += char;
+
+          if (bracketDepth === 0) {
+            // Object is complete
+            if (objectsSkipped < offset) {
+              objectsSkipped++;
+            } else {
+              try {
+                const ch = JSON.parse(currentObject);
+                results.push({
+                  ...ch,
+                  stream: streams.get(ch.id) || null
+                });
+                
+                if (results.length >= limit) {
+                  stream.destroy(); // STOP the stream immediately
+                  resolve(results);
+                  return;
+                }
+              } catch (e) {
+                // Continue on parse error
+              }
+            }
+          }
+        } else if (bracketDepth > 0) {
+          currentObject += char;
+        }
+      }
+    });
+
+    stream.on('end', () => resolve(results));
+    stream.on('error', (err) => reject(err));
+  });
 }
 
 export async function getShortId(originalId: string): Promise<string> {
@@ -62,7 +148,6 @@ export async function getShortId(originalId: string): Promise<string> {
 
     return shortId;
   } catch (err) {
-    console.warn(`[DB] Error mapping ${originalId}, using original ID as fallback:`, err);
     return originalId;
   }
 }
@@ -75,79 +160,46 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
       .eq('short_id', shortId)
       .single();
 
-    return existing?.original_id || shortId; // Fallback to shortId if mapping doesn't exist
+    return existing?.original_id || shortId;
   } catch (err) {
     return shortId;
   }
 }
 
 /**
- * List Channels
+ * List Channels (Piece-by-Piece)
  */
 router.get('/', async (c) => {
-  const limit = parseInt(c.req.query('limit') || '50', 10);
-  console.log(`[Channels] Request received. Limit: ${limit}`);
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 500);
+  const offset = parseInt(c.req.query('offset') || '0', 10);
   
   try {
-    const client = await getClient();
-    const data = client.getData();
+    const enrichedSlice = await fetchChannelsSegmented(offset, limit);
     
-    const allChannels = data.channels.all();
-    console.log(`[Channels] Raw channels from SDK: ${allChannels.length}`);
-
-    if (allChannels.length === 0) {
-      console.error('[Channels] SDK returned 0 channels. This might be a loading issue.');
-      return c.json({ 
-        code: 500, 
-        message: 'Channel database is empty or still loading.',
-        request_id: c.req.header('x-vercel-id') || 'internal'
-      }, 500);
-    }
-
-    const blockedIds = data.blocklist ? data.blocklist.all().map((b: any) => b.channel) : [];
-    const filtered = allChannels.filter((ch: any) => !blockedIds.includes(ch.id));
-    
-    const slice = filtered.slice(0, limit);
-    console.log(`[Channels] Processing slice of ${slice.length} channels...`);
-    
-    const results = await Promise.all(slice.map(async (ch: any) => {
-      try {
-        const shortId = await getShortId(ch.id);
-        const chStreams = data.streams.filter((s: any) => s.channel === ch.id).all();
-        const qualities = chStreams.map((s: any) => s.quality).filter(Boolean);
-        const quality = qualities.length > 0 ? qualities[0] : 'SD';
-
-        return {
-          id: shortId,
-          name: ch.name,
-          logo: ch.logo,
-          category: ch.categories?.[0] || 'General',
-          country: ch.countries?.[0] || 'Unknown',
-          quality: quality,
-          language: ch.languages?.[0] || 'English'
-        };
-      } catch (err) {
-        // Fallback mapping
-        return {
-          id: ch.id,
-          name: ch.name,
-          logo: ch.logo,
-          category: ch.categories?.[0] || 'General',
-          country: ch.countries?.[0] || 'Unknown',
-          quality: 'SD',
-          language: ch.languages?.[0] || 'English'
-        };
-      }
+    const results = await Promise.all(enrichedSlice.map(async (ch: any) => {
+      const shortId = await getShortId(ch.id);
+      return {
+        id: shortId,
+        original_id: ch.id,
+        name: ch.name,
+        country: ch.country,
+        subdivision: ch.subdivision,
+        city: ch.city,
+        languages: ch.languages,
+        categories: ch.categories,
+        logo: ch.logo,
+        stream: ch.stream,
+        is_nsfw: ch.is_nsfw
+      };
     }));
 
-    console.log(`[Channels] Returning ${results.length} results.`);
     return c.json(results);
-  } catch (error) {
-    console.error('[Channels] Route error:', error);
+  } catch (error: any) {
+    console.error('[Channels] Streaming error:', error);
     return c.json({ 
       code: 500,
-      message: 'Failed to fetch channels', 
-      detail: (error as Error).message,
+      message: 'Failed to stream channel pieces', 
+      detail: error.message,
       url: c.req.url
     }, 500);
   }
@@ -158,25 +210,14 @@ router.get('/', async (c) => {
  */
 router.get('/:id', async (c) => {
   const shortId = c.req.param('id');
-  const resolution = c.req.query('res');
   
   try {
     const originalId = await getOriginalId(shortId);
-    if (!originalId) return c.json({ error: 'Channel not found' }, 404);
-
-    const client = await getClient();
-    const data = client.getData();
-    const chStreams = data.streams.filter((s: any) => s.channel === originalId).all();
+    const streams = await getStreamIndex();
     
-    if (chStreams.length === 0) return c.json({ error: 'No streams found' }, 404);
+    const streamUrl = streams.get(originalId || '');
+    if (!streamUrl) return c.json({ error: 'Stream not found' }, 404);
 
-    let selectedStream = chStreams[0];
-    if (resolution) {
-      const match = chStreams.find((s: any) => s.quality === resolution);
-      if (match) selectedStream = match;
-    }
-
-    const streamUrl = selectedStream.url;
     const response = await axios.get(streamUrl, {
       responseType: 'text',
       headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -199,7 +240,6 @@ router.get('/:id', async (c) => {
       'Access-Control-Allow-Origin': '*'
     });
   } catch (error) {
-    console.error('Proxy error:', error);
     return c.json({ error: 'Failed to proxy stream' }, 500);
   }
 });

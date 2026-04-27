@@ -20,6 +20,7 @@ import follow from './Social/Follow.js';
 import adminDashboard from './Admin/Dashboard.js';
 import adminUsers from './Admin/Users.js';
 import comments from './Channels/Comments.js';
+import iptv from './Channels/IPTV.js';
 
 // Core Imports
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
@@ -121,6 +122,7 @@ app.route('/api/account/2fa', twoFactor);
 app.route('/api/channels', channels);
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/comments', comments);
+app.route('/api/channels', iptv);
 app.route('/api/social/profile', profile);
 app.route('/api/social/follow', follow);
 app.route('/api/admin/dashboard', adminDashboard);
