@@ -1,12 +1,9 @@
-import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { logger } from 'hono/logger';
-import { cors } from 'hono/cors';
 import axios from 'axios';
 import sharp from 'sharp';
 import { nanoid } from 'nanoid';
 
-const app = new Hono();
+const router = new Hono();
 
 // In-memory store for image URL mappings with expiration
 interface StoredUrl {
@@ -28,25 +25,12 @@ setInterval(() => {
   }
 }, EXPIRATION_TIME);
 
-// Middleware
-app.use('*', logger());
-app.use('*', cors());
-
-// Health Check
-app.get('/', (c) => {
-  return c.json({
-    status: 'ok',
-    message: 'IPTVCloud Backend API is running',
-    timestamp: new Date().toISOString(),
-  });
-});
-
 /**
  * Image ID Generation API (POST)
  * Accepts JSON: { "url": "..." }
  * Returns JSON: { "id": "short_id" }
  */
-app.post('/api/image', async (c) => {
+router.post('/', async (c) => {
   try {
     const { url } = await c.req.json();
     if (!url) {
@@ -78,7 +62,7 @@ app.post('/api/image', async (c) => {
  * Image Proxy API (GET)
  * Parameters: id, height, width, quality
  */
-app.get('/api/image', async (c) => {
+router.get('/', async (c) => {
   const shortId = c.req.query('url') || c.req.query('id');
   const height = parseInt(c.req.query('height') || '', 10);
   const width = parseInt(c.req.query('width') || c.req.query('weight') || '', 10);
@@ -129,7 +113,7 @@ app.get('/api/image', async (c) => {
  * Branding Assets API
  * Parameters: color (black/white/colored), image (logo/brand), type (svg/png), height, width, quality
  */
-app.get('/api/image/branding', async (c) => {
+router.get('/branding', async (c) => {
   const color = c.req.query('color'); // black, white, or empty for colored
   const imageType = c.req.query('image') || 'logo'; // logo or brand
   const fileExtension = c.req.query('type') || 'svg'; // svg or png
@@ -191,11 +175,4 @@ app.get('/api/image/branding', async (c) => {
   }
 });
 
-// Start Server
-const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-console.log(`Server is running on port ${port}`);
-
-serve({
-  fetch: app.fetch,
-  port,
-});
+export default router;
