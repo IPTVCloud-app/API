@@ -4,64 +4,105 @@ import { logger } from 'hono/logger';
 import { cors } from 'hono/cors';
 import { handle } from 'hono/vercel';
 import { rateLimiter } from 'hono-rate-limiter';
-import images from './routes/images.js';
-import auth from './routes/auth.js';
+
+// Route Imports
+import signUp from './Auth/SignUp.js';
+import signIn from './Auth/SignIn.js';
+import forgotPassword from './Auth/ForgotPassword.js';
+import settings from './Account/Settings.js';
+import privacy from './Account/Privacy.js';
+import credentials from './Account/Credentials.js';
+import twoFactor from './Account/TwoFactor.js';
+import channels from './Channels/Channel.js';
+import thumbnail from './Channels/Thumbnail.js';
+import profile from './Social/Profile.js';
+import follow from './Social/Follow.js';
+import adminDashboard from './Admin/Dashboard.js';
+import adminUsers from './Admin/Users.js';
+import comments from './Channels/Comments.js';
+
+// Core Imports
+import { errorHandler, notFoundHandler } from './ErrorHandler.js';
+import cron from 'node-cron';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 const app = new Hono();
 
-// Middleware
+// Daily Cleanup Cron (00:00)
+cron.schedule('0 0 * * *', () => {
+  console.log('🧹 Running daily thumbnail cleanup...');
+  const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
+  if (fs.existsSync(tempDir)) {
+    const files = fs.readdirSync(tempDir);
+    const now = Date.now();
+    files.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      const stats = fs.statSync(filePath);
+      if (now - stats.mtimeMs > 24 * 60 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+      }
+    });
+  }
+});
+
+// 1. Global Middleware
 app.use('*', logger());
 app.use('*', cors({
-  origin: (origin) => {
-    const envOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [];
-    const defaultOrigins = ['https://iptvcloudapp.vercel.app', 'http://localhost:3000'];
-    const allowedOrigins = [...new Set([...envOrigins, ...defaultOrigins])];
-    
-    return allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
-  },
+  origin: (origin) => origin, // Reflect the origin to allow all domains while supporting credentials
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
 
-// Rate Limiter for Auth
-const authLimiter = rateLimiter({
+// 2. Universal Rate Limiting
+const globalLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  limit: 20, // Increased limit to accommodate OTP requests
+  limit: 100, // 100 requests per IP per window
   standardHeaders: 'draft-6',
-  keyGenerator: (c) => c.req.header('x-forwarded-for') || '', 
+  keyGenerator: (c) => c.req.header('x-forwarded-for') || c.req.header('remote-addr') || '',
 });
+app.use('*', globalLimiter);
 
-// Health Check
+// 3. Root Redirect
 app.get('/', (c) => {
-  return c.json({
-    status: 'ok',
-    message: 'IPTVCloud Backend is running',
-    timestamp: new Date().toISOString(),
-  });
+  const frontendUrl = process.env.FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
+  return c.redirect(frontendUrl);
 });
 
-// Routes
-app.use('/auth/*', authLimiter);
-app.route('/api/image', images);
-app.route('/auth', auth);
+// 4. Routes registration
+app.route('/auth/signup', signUp);
+app.route('/auth/signin', signIn);
+app.route('/auth/forgot-password', forgotPassword);
+app.route('/api/account/settings', settings);
+app.route('/api/account/privacy', privacy);
+app.route('/api/account/credentials', credentials);
+app.route('/api/account/2fa', twoFactor);
+app.route('/api/channels', channels);
+app.route('/api/channels/thumbnail', thumbnail);
+app.route('/api/channels/comments', comments);
+app.route('/api/social/profile', profile);
+app.route('/api/social/follow', follow);
+app.route('/api/admin/dashboard', adminDashboard);
+app.route('/api/admin/users', adminUsers);
 
-// Export for Vercel
+// 5. Global Error & 404 Handlers
+app.onError(errorHandler);
+app.notFound(notFoundHandler);
+
+// Vercel Exports
 export const GET = handle(app);
 export const POST = handle(app);
 export const PUT = handle(app);
 export const DELETE = handle(app);
 export const PATCH = handle(app);
 
-// Local Server logic (ignored by Vercel)
+// Local Server logic
 if (process.env.NODE_ENV !== 'production') {
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
   console.log(`Server is running on port ${port}`);
-
-  serve({
-    fetch: app.fetch,
-    port,
-  });
+  serve({ fetch: app.fetch, port });
 }
 
 export default handle(app);
