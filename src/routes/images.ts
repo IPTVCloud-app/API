@@ -53,7 +53,7 @@ router.post('/', async (c) => {
     });
 
     return c.json({ id });
-  } catch (error) {
+  } catch {
     return c.json({ error: 'Invalid JSON body' }, 400);
   }
 });

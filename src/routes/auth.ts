@@ -44,11 +44,36 @@ const forgotPasswordSchema = z.object({
   email: z.string().email(),
 });
 
+const resetPasswordSchema = z.object({
+  email: z.string().email(),
+  token: z.string().length(6),
+  password: z.string().min(8),
+});
+
 // --- Helper Functions ---
 
 const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 const createOrUpdateOtp = async (email: string, type: 'login' | 'reset') => {
+  // Check cooldown (60 seconds)
+  const { data: existing } = await supabase
+    .from('auth_codes')
+    .select('expires_at')
+    .eq('email', email)
+    .eq('type', type)
+    .single();
+
+  if (existing) {
+    const expiresAt = new Date(existing.expires_at).getTime();
+    const createdAt = expiresAt - (30 * 60 * 1000); // Assuming 30m TTL
+    const now = Date.now();
+    const diff = Math.floor((now - createdAt) / 1000);
+    
+    if (diff < 60) {
+      throw new Error(`Please wait ${60 - diff} seconds before requesting a new code`);
+    }
+  }
+
   const code = generateOtp();
   const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes
 
@@ -89,7 +114,7 @@ auth.post('/signup', zValidator('json', signupSchema), async (c) => {
     const hashedPassword = await bcrypt.hash(data.password, salt);
 
     // 3. Create user
-    const { data: newUser, error: createError } = await supabase
+    const { error: createError } = await supabase
       .from('users')
       .insert([{ 
         email: data.email, 
@@ -100,9 +125,7 @@ auth.post('/signup', zValidator('json', signupSchema), async (c) => {
         last_name: data.lastName,
         suffix: data.suffix,
         created_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
+      }]);
 
     if (createError) {
       console.error('Signup error:', createError);
@@ -110,7 +133,7 @@ auth.post('/signup', zValidator('json', signupSchema), async (c) => {
     }
 
     return c.json({ message: 'Account created successfully. Please sign in.' }, 201);
-  } catch (error) {
+  } catch {
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
@@ -144,8 +167,9 @@ auth.post('/signin/init', zValidator('json', signinInitSchema), async (c) => {
     await sendVerificationEmail(email, code);
 
     return c.json({ message: 'Verification code sent' }, 200);
-  } catch (error: any) {
-    return c.json({ error: error.message || 'Internal server error' }, 500);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Internal server error';
+    return c.json({ error: message }, 500);
   }
 });
 
@@ -177,6 +201,10 @@ auth.post('/signin/verify', zValidator('json', signinVerifySchema), async (c) =>
       .eq('email', email)
       .single();
 
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
     // 3. Generate JWT
     const token = await sign({ 
       id: user.id, 
@@ -192,7 +220,7 @@ auth.post('/signin/verify', zValidator('json', signinVerifySchema), async (c) =>
       token,
       user: { id: user.id, email: user.email, username: user.username }
     }, 200);
-  } catch (error) {
+  } catch {
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
@@ -206,8 +234,9 @@ auth.post('/otp/resend', zValidator('json', resendOtpSchema), async (c) => {
     const code = await createOrUpdateOtp(email, 'login');
     await sendVerificationEmail(email, code);
     return c.json({ message: 'Code resent' }, 200);
-  } catch (error: any) {
-    return c.json({ error: error.message || 'Internal server error' }, 500);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Internal server error';
+    return c.json({ error: message }, 500);
   }
 });
 
@@ -217,13 +246,13 @@ auth.post('/otp/resend', zValidator('json', resendOtpSchema), async (c) => {
 auth.post('/find-account', zValidator('json', findAccountSchema), async (c) => {
   const { username } = c.req.valid('json');
   try {
-    const { data: user, error } = await supabase
+    const { data: user } = await supabase
       .from('users')
       .select('email')
       .eq('username', username)
       .single();
 
-    if (error || !user) {
+    if (!user) {
       return c.json({ error: 'Account not found' }, 404);
     }
 
@@ -233,7 +262,7 @@ auth.post('/find-account', zValidator('json', findAccountSchema), async (c) => {
     const maskedEmail = `${maskedLocal}@${domain}`;
 
     return c.json({ email: user.email, maskedEmail }, 200);
-  } catch (error) {
+  } catch {
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
@@ -260,7 +289,52 @@ auth.post('/password/forgot', zValidator('json', forgotPasswordSchema), async (c
     await sendPasswordResetEmail(email, resetLink);
 
     return c.json({ message: 'Reset link sent successfully' }, 200);
-  } catch (error) {
+  } catch {
+    return c.json({ error: 'Internal server error' }, 500);
+  }
+});
+
+/**
+ * Reset Password Route
+ */
+auth.post('/password/reset', zValidator('json', resetPasswordSchema), async (c) => {
+  const { email, token, password } = c.req.valid('json');
+
+  try {
+    // 1. Verify token
+    const { data: otpData, error: otpError } = await supabase
+      .from('auth_codes')
+      .select('*')
+      .eq('email', email)
+      .eq('code', token)
+      .eq('type', 'reset')
+      .gt('expires_at', new Date().toISOString())
+      .single();
+
+    if (otpError || !otpData) {
+      return c.json({ error: 'Invalid or expired reset link' }, 400);
+    }
+
+    // 2. Hash new password
+    const salt = await bcrypt.genSalt(12);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // 3. Update user
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ password_hash: hashedPassword })
+      .eq('email', email);
+
+    if (updateError) {
+      console.error('Password update error:', updateError);
+      return c.json({ error: 'Failed to update password' }, 500);
+    }
+
+    // 4. Clean up
+    await supabase.from('auth_codes').delete().eq('email', email).eq('type', 'reset');
+
+    return c.json({ message: 'Password updated successfully' }, 200);
+  } catch {
     return c.json({ error: 'Internal server error' }, 500);
   }
 });

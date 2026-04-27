@@ -34,8 +34,9 @@ app.get('/', (c) => {
 });
 
 // Routes
+app.use('/auth/*', authLimiter);
 app.route('/api/image', images);
-app.route('/auth', authLimiter, auth);
+app.route('/auth', auth);
 
 // Export for Vercel
 export const GET = handle(app);
