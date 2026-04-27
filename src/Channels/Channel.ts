@@ -40,7 +40,6 @@ async function getMetadataMaps() {
       axios.get(TIMEZONES_URL).then(r => r.data)
     ]);
 
-    // Map country code to list of timezone names (using 'code' field)
     const countryToTz = new Map<string, string[]>();
     tz.forEach((t: any) => {
       t.countries?.forEach((code: string) => {
@@ -224,7 +223,6 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               } else {
                 const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
                 
-                // Construct clean object: Use data or null for empty
                 const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
                 const tzList = meta.timezones.get(ch.country) || [];
 
@@ -239,9 +237,9 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
                   geo_blocked: isGeoBlocked,
                   highest_allowed_quality: allowedStreams.length > 0 ? allowedStreams[0].quality : null,
                   available_streams: allowedStreams.length,
+                  available_resolutions: allowedStreams.map((s: any) => s.quality),
                   primary_stream_url: allowedStreams.length > 0 ? allowedStreams[0].url : null
                 });
-                
                 if (results.length >= limit) { streamData.destroy(); resolve(results); return; }
               }
             } catch (e) {}
@@ -257,7 +255,35 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 }
 
 /**
- * ABR Stream Controller
+ * HLS Chunk Proxy
+ * Ensures chunks are fetched with the correct headers (User-Agent, etc.)
+ */
+router.get('/stream/chunk', async (c) => {
+  const url = c.req.query('u');
+  const ua = c.req.query('ua') || 'Mozilla/5.0';
+
+  if (!url) return c.json({ error: 'URL required' }, 400);
+
+  try {
+    const response = await axios({
+      method: 'get',
+      url: decodeURIComponent(url),
+      responseType: 'stream',
+      headers: { 'User-Agent': decodeURIComponent(ua) }
+    });
+
+    return c.body(response.data, 200, {
+      'Content-Type': response.headers['content-type'] || 'video/MP2T',
+      'Cache-Control': 'public, max-age=10',
+      'Access-Control-Allow-Origin': '*'
+    });
+  } catch (err) {
+    return c.json({ error: 'Chunk proxy error' }, 500);
+  }
+});
+
+/**
+ * ABR Stream Controller (Full Proxy)
  */
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
@@ -278,65 +304,41 @@ router.get('/stream', async (c) => {
 
     const highestAvailable = allowedStreams[0];
 
-    // 1. Browser Detection
-    const acceptHeader = c.req.header('accept') || '';
-    if (!resolution && acceptHeader.includes('text/html')) {
-      const playerUrl = `${baseUrl}/api/channels/stream?id=${shortId}`;
-      return c.html(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <title>IPTVCloud Player</title>
-          <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-          <style>
-            body { margin: 0; background: #000; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
-            video { width: 100%; height: 100%; max-width: 100vw; max-height: 100vh; }
-            .info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px 10px; border-radius: 5px; pointer-events: none; }
-          </style>
-        </head>
-        <body>
-          <div class="info">Playing: ${shortId} (${highestAvailable.quality})</div>
-          <video id="video" controls autoplay playsinline></video>
-          <script>
-            var video = document.getElementById('video');
-            var streamUrl = '${playerUrl}';
-            if (Hls.isSupported()) {
-              var hls = new Hls();
-              hls.loadSource(streamUrl);
-              hls.attachMedia(video);
-              hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play(); });
-            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-              video.src = streamUrl;
-              video.addEventListener('loadedmetadata', function() { video.play(); });
-            }
-          </script>
-        </body>
-        </html>
-      `);
-    }
-
-    // 2. Specific Resolution Proxy
+    // 1. Specific Resolution Proxy (with chunk rewriting)
     if (resolution) {
       if (getQualityWeight(resolution) > getQualityWeight(highestAvailable.quality)) {
         return c.json({ code: 403, message: `Quality limit exceeded.` }, 403);
       }
       const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
-      const response = await axios.get(selected.url, { responseType: 'text', headers: { 'User-Agent': selected.user_agent || 'Mozilla/5.0' } });
+      const streamUrl = selected.url;
+      const userAgent = selected.user_agent || 'Mozilla/5.0';
+      
+      const response = await axios.get(streamUrl, {
+        responseType: 'text',
+        headers: { 'User-Agent': userAgent }
+      });
+
       let content = response.data;
-      const streamBase = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
+      const streamBase = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
+      
+      // Rewrite chunks to use our internal proxy
       const rewrittenLines = content.split('\n').map((line: string) => {
         const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('http')) return new URL(trimmed, streamBase).href;
+        if (trimmed && !trimmed.startsWith('#')) {
+          const absoluteUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, streamBase).href;
+          return `${baseUrl}/api/channels/stream/chunk?u=${encodeURIComponent(absoluteUrl)}&ua=${encodeURIComponent(userAgent)}`;
+        }
         return line;
       });
+
       return c.body(rewrittenLines.join('\n'), 200, { 
-        'Content-Type': 'application/vnd.apple.mpegurl', 
+        'Content-Type': 'application/x-mpegURL', 
         'Cache-Control': 'no-cache', 
         'Access-Control-Allow-Origin': '*' 
       });
     }
 
-    // 3. Master M3U8 for ABR
+    // 2. Master M3U8 for ABR
     let masterM3U8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
     allowedStreams.forEach((s: any) => {
       let bandwidth = 800000;
@@ -344,12 +346,13 @@ router.get('/stream', async (c) => {
       if (s.quality === '1080p') { bandwidth = 5000000; resText = '1920x1080'; }
       else if (s.quality === '720p') { bandwidth = 2800000; resText = '1280x720'; }
       else if (s.quality === '480p') { bandwidth = 1200000; resText = '854x480'; }
+      
       masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resText},NAME="${s.quality}"\n`;
       masterM3U8 += `${baseUrl}/api/channels/stream?id=${shortId}&res=${s.quality}\n`;
     });
 
     return c.body(masterM3U8, 200, { 
-      'Content-Type': 'application/vnd.apple.mpegurl', 
+      'Content-Type': 'application/x-mpegURL', 
       'Cache-Control': 'no-cache',
       'Access-Control-Allow-Origin': '*'
     });
