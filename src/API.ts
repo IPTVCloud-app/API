@@ -53,6 +53,9 @@ app.get('/', (c) => {
   return c.redirect(frontendUrl);
 });
 
+// Health Check
+app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
+
 // 4. Admin Cleanup (Vercel Cron)
 app.get('/api/admin/cleanup', (c) => {
   console.log('🧹 Running daily thumbnail cleanup...');
@@ -93,13 +96,6 @@ app.route('/api/admin/users', adminUsers);
 // 5. Global Error & 404 Handlers
 app.onError(errorHandler);
 app.notFound(notFoundHandler);
-
-// Vercel Exports
-export const GET = handle(app);
-export const POST = handle(app);
-export const PUT = handle(app);
-export const DELETE = handle(app);
-export const PATCH = handle(app);
 
 // Local Server logic
 if (process.env.NODE_ENV !== 'production') {
