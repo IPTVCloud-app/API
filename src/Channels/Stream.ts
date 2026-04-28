@@ -1,7 +1,7 @@
 import { Hono, Context } from 'hono';
 import axios from 'axios';
 import { HTTPException } from 'hono/http-exception';
-import { stream } from 'hono/streaming';
+import { stream as honoStream } from 'hono/streaming';
 // @ts-expect-error mux.js does not have official types
 import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
@@ -18,6 +18,7 @@ interface StreamSource {
   quality: string;
   user_agent: string | null;
   channel?: string;
+  label?: string;
 }
 
 interface MuxEvent {
@@ -36,6 +37,39 @@ interface MuxjsNamespace {
   mp4: {
     Transmuxer: new (options: { keepOriginalTimestamps: boolean }) => MuxjsTransmuxer;
   };
+}
+
+/* -------------------------------------------------------
+   STATUS CACHE & CHECK
+------------------------------------------------------- */
+const statusCache = new Map<string, { status: string, time: number }>();
+const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
+
+async function checkStreamStatus(url: string, ua: string): Promise<string> {
+  if (!url) return 'offline';
+  const cached = statusCache.get(url);
+  if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
+
+  try {
+    const res = await fetch(url, { 
+      method: 'HEAD',
+      headers: { 'User-Agent': ua },
+      signal: AbortSignal.timeout(2000)
+    });
+    
+    let status = 'offline';
+    if (res.status === 403) {
+      status = 'geo-blocked';
+    } else if (res.status < 400) {
+      status = 'online';
+    }
+    
+    statusCache.set(url, { status, time: Date.now() });
+    return status;
+  } catch {
+    statusCache.set(url, { status: 'offline', time: Date.now() });
+    return 'offline';
+  }
 }
 
 /* -------------------------------------------------------
@@ -60,7 +94,7 @@ export async function getStreamIndex(): Promise<Map<string, StreamSource[]>> {
       if (!s.channel) return;
       const key = String(s.channel).toLowerCase();
       const arr = map.get(key) || [];
-      arr.push({ url: s.url, quality: s.quality || 'SD', user_agent: s.user_agent || null });
+      arr.push({ url: s.url, quality: s.quality || 'SD', user_agent: s.user_agent || null, label: s.label || null });
       map.set(key, arr);
     });
     for (const [k, arr] of map.entries()) {
@@ -92,27 +126,46 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
   }
 }
 
-async function relayStream(c: Context, sourceUrl: string, ua: string) {
-  // SET HEADERS IMMEDIATELY TO PREVENT "WAITING FOR RESPONSE"
+async function relayStream(c: Context, selected: StreamSource) {
+  const sourceUrl = selected.url;
+  const ua = selected.user_agent || 'Mozilla/5.0';
+  const referer = new URL(sourceUrl).origin;
+
+  // 1. Initial Status Check
+  const status = await checkStreamStatus(sourceUrl, ua);
+  if (status === 'geo-blocked') {
+    throw new HTTPException(403, { 
+      message: 'This stream is geo-blocked in your region/IP. Please use a VPN or try another channel.' 
+    });
+  }
+  if (status === 'offline') throw new HTTPException(404, { message: 'Stream is offline' });
+
+  // 2. Setup Headers (Instant Response)
   c.header('Content-Type', 'video/mp4');
   c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
   c.header('Connection', 'keep-alive');
   c.header('X-Content-Type-Options', 'nosniff');
-  c.header('X-Accel-Buffering', 'no'); // CRITICAL FOR VERCEL STREAMING
+  c.header('X-Accel-Buffering', 'no'); 
 
-  return stream(c, async (streamInstance) => {
+  // 3. Continuous fMP4 Streaming
+  return honoStream(c, async (streamInstance) => {
     const transmuxer = new (muxjs as unknown as MuxjsNamespace).mp4.Transmuxer({
       keepOriginalTimestamps: true,
     });
 
     let initSent = false;
     let isActive = true;
-    let dataQueue: MuxEvent[] = [];
     const seenSegments = new Set<string>();
-    const referer = new URL(sourceUrl).origin;
 
-    transmuxer.on('data', (event: MuxEvent) => {
-      dataQueue.push(event);
+    // Pattern: Capture fragments and write immediately
+    transmuxer.on('data', async (event: MuxEvent) => {
+      if (!initSent && event.initSegment) {
+        await streamInstance.write(event.initSegment);
+        initSent = true;
+      }
+      if (event.data) {
+        await streamInstance.write(event.data);
+      }
     });
 
     streamInstance.onAbort(() => {
@@ -151,7 +204,7 @@ async function relayStream(c: Context, sourceUrl: string, ua: string) {
           }
         }
 
-        // Jump to live edge
+        // Jump to live edge on initial load
         if (seenSegments.size === 0 && segmentUrls.length > 3) {
           segmentUrls.slice(0, -3).forEach(u => seenSegments.add(u));
         }
@@ -167,22 +220,11 @@ async function relayStream(c: Context, sourceUrl: string, ua: string) {
             
             if (res.ok && isActive) {
               const tsBuffer = await res.arrayBuffer();
+              // Pattern: Push and flush per segment
               transmuxer.push(new Uint8Array(tsBuffer));
               transmuxer.flush();
-
-              while (dataQueue.length > 0) {
-                const event = dataQueue.shift();
-                if (!event) break;
-                if (event.initSegment && !initSent) {
-                  await streamInstance.write(event.initSegment);
-                  initSent = true;
-                }
-                if (event.data) {
-                  await streamInstance.write(event.data);
-                }
-              }
             }
-          } catch { /* Skip bad segment */ }
+          } catch { /* Skip corrupted segment */ }
 
           seenSegments.add(url);
           if (seenSegments.size > 50) {
@@ -198,9 +240,7 @@ async function relayStream(c: Context, sourceUrl: string, ua: string) {
     } catch {
       /* Silently close */
     } finally {
-      isActive = false;
       transmuxer.dispose();
-      dataQueue = [];
     }
   });
 }
@@ -231,7 +271,7 @@ router.get('/', async (c) => {
     if (found) selected = found;
   }
 
-  return relayStream(c, selected.url, selected.user_agent || 'Mozilla/5.0');
+  return relayStream(c, selected);
 });
 
 export default router;
