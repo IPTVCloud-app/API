@@ -100,6 +100,7 @@ export async function relayStream(c: Context, selected: StreamSource) {
   const ua = selected.user_agent || 'Mozilla/5.0';
 
   const status = await checkStreamStatus(selected.url, ua);
+  console.log(`DEBUG: Stream status for ${selected.url}: ${status}`);
 
   if (status === 'geo-blocked') {
     throw new HTTPException(403, {
@@ -107,6 +108,8 @@ export async function relayStream(c: Context, selected: StreamSource) {
     });
   }
 
+  // NOTE: If status is 'online' but we can't fetch segments, it might still fail later.
+  // We should not block here if the head check passed, but provide feedback.
   if (status === 'offline') {
     throw new HTTPException(404, { message: 'Stream offline' });
   }
@@ -160,12 +163,15 @@ export async function relayStream(c: Context, selected: StreamSource) {
     ------------------------------- */
     const fetchPlaylist = async () => {
       try {
+        console.log(`DEBUG: Fetching playlist from: ${selected.url}`);
         const res = await axios.get<string>(selected.url, {
           headers: { 'User-Agent': ua },
           timeout: 4000,
           responseType: 'text'
         });
 
+        console.log(`DEBUG: Successfully fetched playlist. Length: ${res.data.length}`);
+        
         const base = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
 
         return res.data
@@ -181,7 +187,8 @@ export async function relayStream(c: Context, selected: StreamSource) {
           })
           .filter(Boolean) as string[];
 
-      } catch {
+      } catch (err: any) {
+        console.error(`DEBUG: Failed to fetch playlist from ${selected.url}:`, err.message);
         return [];
       }
     };
