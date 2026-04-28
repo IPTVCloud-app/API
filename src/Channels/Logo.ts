@@ -1,22 +1,18 @@
 import { Hono } from 'hono';
-import sharp from 'sharp';
+import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import axios from 'axios';
 import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
 
 const LOGOS_URL = 'https://iptv-org.github.io/api/logos.json';
 const GITHUB_LOGO_FALLBACK = 'https://raw.githubusercontent.com/iptv-org/iptv/master/assets/logo.png';
-const TEMP_DIR = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
-
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 let logoIndex: Map<string, string> | null = null;
 let lastLoad = 0;
-const CACHE_TTL = 1000 * 60 * 60;
+const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
 async function getLogoIndex() {
   const now = Date.now();
@@ -28,7 +24,7 @@ async function getLogoIndex() {
     logoIndex = newIndex;
     lastLoad = now;
     return logoIndex;
-  } catch (err) { return logoIndex || new Map(); }
+  } catch (err) { return logoIndex || new Map<string, string>(); }
 }
 
 const BROKEN_IMAGE_SVG = Buffer.from(
@@ -43,36 +39,26 @@ router.get('/', async (c) => {
   const shortId = c.req.query('id');
   if (!shortId) return c.json({ error: 'Channel ID required' }, 400);
 
-  const thumbPath = path.join(TEMP_DIR, `thumb-${shortId}.webp`);
-
   try {
-    if (fs.existsSync(thumbPath)) {
-      const stats = fs.statSync(thumbPath);
-      if ((Date.now() - stats.mtimeMs) < 86400000) { 
-        return c.body(fs.readFileSync(thumbPath), 200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' });
-      }
-    }
-
     const originalId = await getOriginalId(shortId);
     const index = await getLogoIndex();
     const logoUrl = index.get(originalId || '') || GITHUB_LOGO_FALLBACK;
 
-    let buffer: Buffer;
     try {
-      const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-      buffer = Buffer.from(response.data);
+      const response = await axios.get(logoUrl, { 
+        responseType: 'arraybuffer', timeout: 8000, 
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      const contentType = response.headers['content-type'];
+      return c.body(response.data, 200, { 
+        'Content-Type': typeof contentType === 'string' ? contentType : 'image/png', 
+        'Cache-Control': 'public, max-age=86400' 
+      });
     } catch (err) {
       return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
     }
-
-    try {
-      await sharp(buffer).resize(400, 400, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp({ quality: 80 }).toFile(thumbPath);
-      return c.body(fs.readFileSync(thumbPath) as any, 200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' });
-    } catch (e) {
-      return c.body(buffer as any, 200, { 'Content-Type': 'image/png' });
-    }
   } catch (error) {
-    return c.body(BROKEN_IMAGE_SVG as any, 200, { 'Content-Type': 'image/svg+xml' });
+    return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
   }
 });
 

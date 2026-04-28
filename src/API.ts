@@ -13,7 +13,10 @@ import privacy from './Account/Privacy.js';
 import credentials from './Account/Credentials.js';
 import twoFactor from './Account/TwoFactor.js';
 import channels from './Channels/Channel.js';
+import stream from './Channels/Stream.js';
 import thumbnail from './Channels/Thumbnail.js';
+import logo from './Channels/Logo.js';
+import metadata from './Channels/Metadata.js';
 import profile from './Social/Profile.js';
 import follow from './Social/Follow.js';
 import adminDashboard from './Admin/Dashboard.js';
@@ -34,7 +37,7 @@ const app = new Hono();
 // 1. Global Middleware
 app.use('*', logger());
 app.use('*', cors({
-  origin: (origin) => origin, // Reflect origin for cross-domain reliability on Vercel
+  origin: (origin) => origin,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   exposeHeaders: ['Content-Length'],
@@ -45,7 +48,7 @@ app.use('*', cors({
 // 2. Universal Rate Limiting
 const globalLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
-  limit: 200, // Increased for serverless stability
+  limit: 200,
   standardHeaders: 'draft-6',
   keyGenerator: (c) => {
     try {
@@ -57,18 +60,15 @@ const globalLimiter = rateLimiter({
 });
 app.use('*', globalLimiter);
 
-// 3. Root Redirect
 app.get('/', (c) => {
   const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
   return c.redirect(frontendUrl);
 });
 
-// Health Check
 app.get('/api/health', (c) => {
   return c.json({ status: 'ok', time: new Date().toISOString(), database: !!supabase });
 });
 
-// 4. Admin Cleanup (Vercel Cron)
 app.get('/api/admin/cleanup', (c) => {
   console.log('🧹 Running daily thumbnail cleanup...');
   const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
@@ -99,9 +99,14 @@ app.route('/api/account/settings', settings);
 app.route('/api/account/privacy', privacy);
 app.route('/api/account/credentials', credentials);
 app.route('/api/account/2fa', twoFactor);
+
+// Modular Channel Routes
+app.route('/api/channels/stream', stream);
 app.route('/api/channels/thumbnail', thumbnail);
-app.route('/api/channels/logo', thumbnail);
+app.route('/api/channels/logo', logo);
+app.route('/api/channels/meta', metadata); // New base for categories, languages, etc.
 app.route('/api/channels', channels);
+
 app.route('/api/channels/comments', comments);
 app.route('/api/channels', iptv);
 app.route('/api/social/profile', profile);
@@ -109,11 +114,9 @@ app.route('/api/social/follow', follow);
 app.route('/api/admin/dashboard', adminDashboard);
 app.route('/api/admin/users', adminUsers);
 
-// 6. Global Error & 404 Handlers
 app.onError(errorHandler);
 app.notFound(notFoundHandler);
 
-// Vercel Handler refactored for direct Node.js compatibility
 export default async function handler(req: any, res: any) {
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host;
@@ -148,7 +151,6 @@ export default async function handler(req: any, res: any) {
   }
 }
 
-// Local Server logic
 if (process.env.NODE_ENV !== 'production') {
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
   console.log(`Server is running on port ${port}`);
