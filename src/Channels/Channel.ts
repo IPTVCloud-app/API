@@ -17,6 +17,9 @@ const COUNTRIES_URL = 'https://iptv-org.github.io/api/countries.json';
 const LANGUAGES_URL = 'https://iptv-org.github.io/api/languages.json';
 const REGIONS_URL = 'https://iptv-org.github.io/api/regions.json';
 const TIMEZONES_URL = 'https://iptv-org.github.io/api/timezones.json';
+const CATEGORIES_URL = 'https://iptv-org.github.io/api/categories.json';
+const CITIES_URL = 'https://iptv-org.github.io/api/cities.json';
+const SUBDIVISIONS_URL = 'https://iptv-org.github.io/api/subdivisions.json';
 
 // Persistent caches
 let streamIndex: Map<string, any[]> | null = null;
@@ -25,6 +28,9 @@ let metadataMaps: {
   languages: Map<string, string>;
   regions: Map<string, string>;
   timezones: Map<string, string[]>;
+  categories: any[];
+  cities: any[];
+  subdivisions: any[];
 } | null = null;
 let lastIndexLoad = 0;
 const INDEX_TTL = 1000 * 60 * 60; // 1 hour
@@ -40,11 +46,14 @@ async function getMetadataMaps() {
   const now = Date.now();
   if (metadataMaps && (now - lastIndexLoad) < INDEX_TTL) return metadataMaps;
   try {
-    const [cnt, lng, reg, tz] = await Promise.all([
+    const [cnt, lng, reg, tz, cat, city, sub] = await Promise.all([
       axios.get(COUNTRIES_URL).then(r => r.data),
       axios.get(LANGUAGES_URL).then(r => r.data),
       axios.get(REGIONS_URL).then(r => r.data),
-      axios.get(TIMEZONES_URL).then(r => r.data)
+      axios.get(TIMEZONES_URL).then(r => r.data),
+      axios.get(CATEGORIES_URL).then(r => r.data),
+      axios.get(CITIES_URL).then(r => r.data),
+      axios.get(SUBDIVISIONS_URL).then(r => r.data)
     ]);
     const countryToTz = new Map<string, string[]>();
     tz.forEach((t: any) => {
@@ -58,13 +67,41 @@ async function getMetadataMaps() {
       countries: new Map(cnt.map((c: any) => [c.code, c])),
       languages: new Map(lng.map((l: any) => [l.code, l.name])),
       regions: new Map(reg.map((r: any) => [r.code, r.name])),
-      timezones: countryToTz
+      timezones: countryToTz,
+      categories: cat,
+      cities: city,
+      subdivisions: sub
     };
     return metadataMaps;
   } catch (err) {
-    return metadataMaps || { countries: new Map(), languages: new Map(), regions: new Map(), timezones: new Map() };
+    console.error('[Metadata] Failed to load metadata:', err);
+    return metadataMaps || { countries: new Map(), languages: new Map(), regions: new Map(), timezones: new Map(), categories: [], cities: [], subdivisions: [] };
   }
 }
+
+/**
+ * Metadata Endpoints
+ */
+router.get('/categories', async (c) => {
+  const meta = await getMetadataMaps();
+  return c.json(meta.categories);
+});
+
+router.get('/languages', async (c) => {
+  const meta = await getMetadataMaps();
+  const list = Array.from(meta.languages.entries()).map(([code, name]) => ({ code, name }));
+  return c.json(list);
+});
+
+router.get('/cities', async (c) => {
+  const meta = await getMetadataMaps();
+  return c.json(meta.cities);
+});
+
+router.get('/subdivisions', async (c) => {
+  const meta = await getMetadataMaps();
+  return c.json(meta.subdivisions);
+});
 
 /**
  * Check if a stream is online
@@ -218,103 +255,112 @@ async function getShared(channelKey: string, initialUrl: string, ua: string): Pr
 
 /**
  * High-Performance Native MP4 Proxy
- * Zero-Latency Handshake Architecture
+ * Architecture: Synchronous Handshake -> Background Delivery
  */
 router.get('/stream', async (c) => {
   const id = c.req.query('id');
   const res = c.req.query('res') || 'auto';
   if (!id) return c.json({ error: 'ID required' }, 400);
 
-  // Set headers IMMEDIATELY - No await before this!
-  c.header('Content-Type', 'video/mp4');
-  c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
-  c.header('Connection', 'keep-alive');
-  c.header('X-Content-Type-Options', 'nosniff');
-  c.header('Access-Control-Allow-Origin', '*');
-
-  return stream(c, async (stream) => {
-    // 1. Instant satisfy browser (Empty MP4 Atom)
-    stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101])); 
+  try {
+    const origId = await getOriginalId(id);
+    const streams = await getStreamIndex();
+    const chStreams = streams.get(origId || id) || [];
+    const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+    if (allowed.length === 0) return c.json({ error: 'No supported streams' }, 404);
     
-    let isClosed = false;
-    c.req.raw.signal?.addEventListener('abort', () => { isClosed = true; });
+    let idx = 0;
+    if (res !== 'auto') { 
+      const f = allowed.findIndex((s: any) => s.quality === res); 
+      if (f !== -1) idx = f; 
+    }
+    let sel = allowed[idx];
+    const ua = sel.user_agent || 'Mozilla/5.0';
 
-    try {
-      // 2. Resolve stream identity in background
-      const origId = await getOriginalId(id);
-      const streams = await getStreamIndex();
-      const chStreams = streams.get(origId || id) || [];
-      const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-      
-      if (allowed.length === 0 || isClosed) {
-        if (!isClosed) stream.close();
-        return;
-      }
-      
-      let idx = 0;
-      if (res !== 'auto') { 
-        const f = allowed.findIndex((s: any) => s.quality === res); 
-        if (f !== -1) idx = f; 
-      }
-      const sel = allowed[idx];
-      const ua = sel.user_agent || 'Mozilla/5.0';
-      const key = `${id}_${sel.quality}`;
+    // Status check
+    const status = await axios.head(sel.url, { 
+      timeout: 1500, 
+      headers: { 'User-Agent': ua },
+      validateStatus: (s) => s >= 200 && s < 500 
+    }).then(r => r.status === 403 ? 'geo-blocked' : (r.status < 400 ? 'online' : 'offline'))
+      .catch(() => 'online');
 
-      // 3. Join Shared Pool (Non-blocking check)
-      const shared = await getShared(key, sel.url, ua);
-      if (isClosed) { shared.viewers--; return; }
-      shared.viewers++;
+    if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
+    
+    const channelKey = `${id}_${sel.quality}`;
+    const shared = await getShared(channelKey, sel.url, ua);
+
+    // CRITICAL FIX: Wait for initSegment before opening the stream response
+    // This prevents the "stuck" state where browser doesn't know how to decode.
+    let waitCount = 0;
+    while (!shared.initSegment && waitCount < 10) {
+      await new Promise(r => setTimeout(r, 500));
+      waitCount++;
+    }
+
+    if (!shared.initSegment) return c.json({ error: 'Failed to initialize stream' }, 503);
+
+    c.header('Content-Type', 'video/mp4');
+    c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    c.header('Connection', 'keep-alive');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Access-Control-Allow-Origin', '*');
+
+    return stream(c, async (stream) => {
+      // 1. Send the MP4 Header immediately
+      await stream.write(shared.initSegment!);
 
       const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
-      let initSent = false;
-      
-      transmuxer.on('data', (e: any) => { 
-        if (e.data && !isClosed) stream.write(Buffer.from(e.data)); 
-      });
+      let closed = false;
+      c.req.raw.signal?.addEventListener('abort', () => { closed = true; });
 
-      if (shared.initSegment) {
-        stream.write(shared.initSegment);
-        initSent = true;
-      }
+      transmuxer.on('data', async (e: any) => { 
+        if (e.data && !closed) {
+          try {
+            await stream.write(Buffer.from(e.data));
+          } catch (err) { closed = true; }
+        } 
+      });
 
       const sent = new Set<string>();
       let offset = 0;
 
-      // 4. Main Delivery Loop
-      while (!isClosed) {
-        const fresh = shared.segments.filter(s => !sent.has(s.url));
-        
-        if (fresh.length > 0) {
-          for (const s of fresh) {
-            if (isClosed) break;
-            if (!initSent && !shared.initSegment) {
-              transmuxer.on('data', (e: any) => {
-                if (e.initSegment && !initSent) { 
-                  stream.write(Buffer.from(e.initSegment)); 
-                  initSent = true; 
-                }
-              });
-            }
-            transmuxer.setBaseMediaDecodeTime(offset * 90000);
-            offset += s.duration;
-            transmuxer.push(new Uint8Array(s.data));
-            transmuxer.flush();
-            sent.add(s.url);
-          }
-        } else {
-          // Keep-alive heartbeat while waiting for new source data
-          if (!isClosed) stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
-          await new Promise(r => setTimeout(r, 1000));
-        }
+      // 2. Warm Buffer (Fast Start)
+      const warm = shared.segments.slice(-5);
+      for (const s of warm) {
+        if (closed) break;
+        transmuxer.setBaseMediaDecodeTime(offset * 90000);
+        offset += s.duration;
+        transmuxer.push(new Uint8Array(s.data));
+        transmuxer.flush();
+        sent.add(s.url);
       }
-      
-      shared.viewers--;
-    } catch (err) {
-      console.error('[Stream] Fatal error:', err);
-    } finally {
-      isClosed = true;
-    }
-  });
+
+      // 3. Live Loop
+      try {
+        shared.viewers++;
+        while (!closed) {
+          const fresh = shared.segments.filter(s => !sent.has(s.url));
+          if (fresh.length > 0) {
+            for (const s of fresh) {
+              if (closed) break;
+              transmuxer.setBaseMediaDecodeTime(offset * 90000);
+              offset += s.duration;
+              transmuxer.push(new Uint8Array(s.data));
+              transmuxer.flush();
+              sent.add(s.url);
+            }
+          } else {
+            if (!closed) await stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+      } finally {
+        shared.viewers--;
+        closed = true;
+      }
+    });
+  } catch (error) { return c.json({ error: 'Stream error' }, 500); }
 });
 
 export async function getShortId(originalId: string): Promise<string> {
@@ -335,36 +381,29 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
 }
 
 router.get('/', async (c) => {
-  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 50);
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
   const offset = parseInt(c.req.query('offset') || '0', 10);
   const search = c.req.query('search');
-  const statusFilter = c.req.query('status');
+  const category = c.req.query('category');
+  const language = c.req.query('language');
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const baseUrl = `${protocol}://${c.req.header('host')}`;
   try {
-    const channels = await fetchChannelsSegmented(offset, statusFilter ? limit * 2 : limit, baseUrl, search, {});
-    const streams = await getStreamIndex();
+    const filters = { category, language };
+    const channels = await fetchChannelsSegmented(offset, limit, baseUrl, search, filters);
     const results = await Promise.all(channels.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
-      
-      const chStreams = streams.get(ch.id) || [];
-      const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-      const primaryUrl = allowed.length > 0 ? allowed[0].url : null;
-      const status = await checkStreamStatus(primaryUrl);
-      
-      const item = { 
+      return { 
         ...ch, id: shortId, original_id: ch.id, 
         stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
         thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
         logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
-        status, available_resolutions: allowed.map((s: any) => s.quality), abr_supported: allowed.length > 1
+        status: 'online', 
+        available_resolutions: [], 
+        abr_supported: false
       };
-      delete (item as any).primary_stream_url;
-      return item;
     }));
-    let final = results;
-    if (statusFilter === 'online' || statusFilter === 'offline') final = results.filter(res => res.status === statusFilter);
-    return c.json(final.slice(0, limit));
+    return c.json(results);
   } catch (error: any) { return c.json({ error: 'List error' }, 500); }
 });
 
@@ -408,13 +447,21 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
           if (bracketDepth === 0) {
             try {
               const ch = JSON.parse(currentObject);
-              const countryInfo = meta.countries.get(ch.country);
+              
+              if (filters.category && !ch.categories?.includes(filters.category)) continue;
+              if (filters.language && !ch.languages?.includes(filters.language)) continue;
+
               const chStreams = streams.get(ch.id) || [];
-              const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
-              const matchesSearch = !searchLower || ch.name?.toLowerCase().includes(searchLower) || ch.id?.toLowerCase().includes(searchLower);
+              const matchesSearch = !searchLower || 
+                ch.name?.toLowerCase().includes(searchLower) || 
+                ch.id?.toLowerCase().includes(searchLower) ||
+                ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower));
+
               if (!matchesSearch) continue;
               if (matchesFound < offset) { matchesFound++; } 
               else {
+                const countryInfo = meta.countries.get(ch.country);
+                const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
                 const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
                 const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
                 results.push({
