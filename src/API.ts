@@ -13,8 +13,7 @@ import privacy from './Account/Privacy.js';
 import credentials from './Account/Credentials.js';
 import twoFactor from './Account/TwoFactor.js';
 import channels from './Channels/Channel.js';
-import { relayStream, StreamSource } from './Channels/Stream.js'; // Import relayStream and StreamSource type directly
-import { getOriginalId } from './Channels/Utils.js'; // Import getOriginalId from Utils.js
+import streamRouter from './Channels/Stream.js';
 import thumbnail from './Channels/Thumbnail.js';
 import logo from './Channels/Logo.js';
 import metadata from './Channels/Metadata.js';
@@ -102,34 +101,7 @@ app.route('/api/account/credentials', credentials);
 app.route('/api/account/2fa', twoFactor);
 
 // Modular Channel Routes
-// Registering relayStream as a GET handler for /api/channels/stream
-app.get('/api/channels/stream', async (c: Context) => {
-  const id = c.req.query('id');
-  const res = c.req.query('res'); // This is likely the stream URL
-  const channelQueryParam = c.req.query('channel'); // Use a different name to avoid conflict with imported module
-  const user_agent = c.req.header('user-agent') || null;
-  const label = c.req.query('label') || null;
-
-  if (!id || !res) {
-    return c.json({ error: 'Missing id or res query parameters' }, 400);
-  }
-
-  const originalId = await getOriginalId(id) || id; // Await and ensure it's a string
-
-  // Construct StreamSource object. Inferring quality from URL might be brittle, but matches previous logic.
-  // This quality inference needs to align with how getStreamIndex determines quality.
-  const inferredQuality = res.includes('1080p') ? '1080p' : res.includes('720p') ? '720p' : 'SD';
-
-  const selectedStreamSource: StreamSource = { // Use the imported StreamSource type
-    url: res,
-    quality: inferredQuality,
-    user_agent: user_agent,
-    channel: channelQueryParam || originalId, // Use query param if provided, otherwise use derived originalId
-    label: label
-  };
-
-  return await relayStream(c, selectedStreamSource); // Use the imported relayStream function
-});
+app.route('/api/channels', streamRouter);
 
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/logo', logo);
