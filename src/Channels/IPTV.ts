@@ -43,10 +43,19 @@ router.get('/blocklist', async (c) => c.json(await getCachedData('blocklist')));
 router.get('/feeds', async (c) => c.json(await getCachedData('feeds')));
 router.get('/logos', async (c) => c.json(await getCachedData('logos')));
 
+const streamsCache = new Map<string, { data: any, time: number }>();
+const STREAMS_CACHE_TTL = 1000 * 60 * 15; // 15 minutes
+
 router.get('/streams', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 50); // Hard limit for stability
   const offset = parseInt(c.req.query('offset') || '0', 10);
   
+  const cacheKey = `${limit}:${offset}`;
+  const cached = streamsCache.get(cacheKey);
+  if (cached && (Date.now() - cached.time) < STREAMS_CACHE_TTL) {
+    return c.json(cached.data);
+  }
+
   try {
     const data = await getCachedData('streams');
     const slice = data.slice(offset, offset + limit);
@@ -60,6 +69,7 @@ router.get('/streams', async (c) => {
       };
     }));
 
+    streamsCache.set(cacheKey, { data: results, time: Date.now() });
     return c.json(results);
   } catch (error) {
     return c.json({ error: 'Failed to fetch streams' }, 500);

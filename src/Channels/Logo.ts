@@ -35,9 +35,17 @@ const BROKEN_IMAGE_SVG = Buffer.from(
   </svg>`
 );
 
+const logoCache = new Map<string, { data: any, contentType: string, time: number }>();
+const LOGO_CACHE_TTL = 1000 * 60 * 60 * 24; // 24 hours
+
 router.get('/', async (c) => {
   const shortId = c.req.query('id');
   if (!shortId) return c.json({ error: 'Channel ID required' }, 400);
+
+  const cached = logoCache.get(shortId);
+  if (cached && (Date.now() - cached.time) < LOGO_CACHE_TTL) {
+    return c.body(cached.data, 200, { 'Content-Type': cached.contentType, 'Cache-Control': 'public, max-age=86400' });
+  }
 
   try {
     const originalId = await getOriginalId(shortId);
@@ -49,9 +57,16 @@ router.get('/', async (c) => {
         responseType: 'arraybuffer', timeout: 8000, 
         headers: { 'User-Agent': 'Mozilla/5.0' }
       });
-      const contentType = response.headers['content-type'];
+      const contentType = typeof response.headers['content-type'] === 'string' ? response.headers['content-type'] : 'image/png';
+      
+      logoCache.set(shortId, { data: response.data, contentType, time: Date.now() });
+      if (logoCache.size > 2000) {
+        const firstKey = logoCache.keys().next().value;
+        if (firstKey !== undefined) logoCache.delete(firstKey);
+      }
+
       return c.body(response.data, 200, { 
-        'Content-Type': typeof contentType === 'string' ? contentType : 'image/png', 
+        'Content-Type': contentType, 
         'Cache-Control': 'public, max-age=86400' 
       });
     } catch (err) {

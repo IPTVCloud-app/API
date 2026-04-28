@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import axios from 'axios';
 import { HTTPException } from 'hono/http-exception';
+import { stream } from 'hono/streaming';
 import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
@@ -53,13 +54,13 @@ export async function getStreamIndex() {
  * Designed for Vercel: Stateless, aggressive, and stable.
  */
 async function relayStream(c: any, sourceUrl: string, ua: string) {
-  return c.stream(async (stream: any) => {
+  return stream(c, async (streamInstance: any) => {
     const baseUrl = sourceUrl.substring(0, sourceUrl.lastIndexOf('/') + 1);
     const seenSegments = new Set<string>();
     const segmentBuffer: { url: string; promise: Promise<any> }[] = [];
     let isActive = true;
 
-    stream.onAbort(() => { isActive = false; });
+    streamInstance.onAbort(() => { isActive = false; });
 
     // ⚡ Fast Manifest Monitor
     const monitor = async () => {
@@ -88,15 +89,15 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
                 }).then(res => res.data).catch(() => null);
 
                 segmentBuffer.push({ url: absUrl, promise });
-                if (segmentBuffer.length > 15) segmentBuffer.shift();
+                if (segmentBuffer.length > 20) segmentBuffer.shift();
               }
             }
           }
           
           // Cleanup
-          if (seenSegments.size > 150) {
+          if (seenSegments.size > 200) {
             const arr = Array.from(seenSegments);
-            arr.slice(0, 75).forEach(s => seenSegments.delete(s));
+            arr.slice(0, 100).forEach(s => seenSegments.delete(s));
           }
         } catch (e) {}
         await new Promise(r => setTimeout(r, 2000));
@@ -108,33 +109,26 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
     // ⚡ Sequential Relay Loop
     while (isActive) {
       if (segmentBuffer.length > 0) {
-        const { promise } = segmentBuffer.shift()!;
-        const segmentStream = await promise;
+        const item = segmentBuffer.shift();
+        if (!item) continue;
+        const segmentStream = await item.promise;
         
         if (segmentStream) {
           try {
             for await (const chunk of segmentStream) {
               if (!isActive) {
-                segmentStream.destroy();
+                if (segmentStream.destroy) segmentStream.destroy();
                 break;
               }
-              await stream.write(chunk);
+              await streamInstance.write(chunk);
             }
-          } catch (e) {
+          } catch (e: any) {
             if (segmentStream.destroy) segmentStream.destroy();
           }
         }
       } else {
         await new Promise(r => setTimeout(r, 150));
       }
-    }
-  }, {
-    headers: {
-      'Content-Type': 'video/mp2t',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'X-Content-Type-Options': 'nosniff',
-      'Connection': 'keep-alive',
-      'X-Stream-Engine': 'IPTVCloud-V5'
     }
   });
 }
@@ -165,6 +159,13 @@ router.get('/', async (c) => {
     const found = allowed.find((s: any) => s.quality === res);
     if (found) selected = found;
   }
+
+  // Set Relay Headers
+  c.header('Content-Type', 'video/mp2t');
+  c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Connection', 'keep-alive');
+  c.header('X-Stream-Engine', 'IPTVCloud-V6');
 
   return relayStream(c, selected.url, selected.user_agent || 'Mozilla/5.0');
 });

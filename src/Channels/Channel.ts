@@ -10,6 +10,27 @@ const router = new Hono();
 const CHANNELS_URL = 'https://iptv-org.github.io/api/channels.json';
 
 /* -------------------------------------------------------
+   CACHE SYSTEM
+------------------------------------------------------- */
+const channelListCache = new Map<string, { data: any; time: number }>();
+const CACHE_TTL = 1000 * 60 * 15; // 15 minutes
+
+function getCachedResult(key: string) {
+  const cached = channelListCache.get(key);
+  if (cached && (Date.now() - cached.time) < CACHE_TTL) return cached.data;
+  return null;
+}
+
+function setCachedResult(key: string, data: any) {
+  channelListCache.set(key, { data, time: Date.now() });
+  // Limit cache size
+  if (channelListCache.size > 1000) {
+    const firstKey = channelListCache.keys().next().value;
+    if (firstKey !== undefined) channelListCache.delete(firstKey);
+  }
+}
+
+/* -------------------------------------------------------
    QUALITY FILTER
 ------------------------------------------------------- */
 const QUALITY_WEIGHTS: Record<string, number> = {
@@ -97,6 +118,7 @@ async function fetchChannelsSegmented(
               ch.name?.toLowerCase().includes(searchLower) ||
               ch.id?.toLowerCase().includes(searchLower) ||
               ch.country?.toLowerCase().includes(searchLower) ||
+              ch.city?.toLowerCase().includes(searchLower) ||
               ch.categories?.some((c: string) => c.toLowerCase().includes(searchLower));
 
             if (!matchesSearch) continue;
@@ -115,7 +137,7 @@ async function fetchChannelsSegmented(
 
             // We collect enough candidates to fulfill the limit after status filtering
             // or we stop if we hit a reasonable buffer.
-            if (candidates.length >= limit * 2) {
+            if (candidates.length >= limit * 3) { // Buffer increased for status filtering
               streamData.destroy();
               break;
             }
@@ -125,7 +147,7 @@ async function fetchChannelsSegmented(
         currentObject += char;
       }
     }
-    if (bracketDepth === 0 && candidates.length >= limit * 2) break;
+    if (bracketDepth === 0 && candidates.length >= limit * 3) break;
   }
 
   /* ---------------- BATCH STATUS CHECKS ---------------- */
@@ -186,6 +208,10 @@ router.get('/', async (c) => {
   const region = getParam('region');
   const status = getParam('status');
 
+  const cacheKey = JSON.stringify({ limit, offset, search, country, category, language, city, subdivision, region, status });
+  const cached = getCachedResult(cacheKey);
+  if (cached) return c.json(cached);
+
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const baseUrl = `${protocol}://${c.req.header('host')}`;
 
@@ -223,6 +249,7 @@ router.get('/', async (c) => {
       })
     );
 
+    setCachedResult(cacheKey, results);
     return c.json(results);
   } catch (error) {
     console.error('[Channel List Error]', error);
