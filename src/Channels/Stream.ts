@@ -387,7 +387,7 @@ router.get('/stream', async (c) => {
     });
 
     return c.body(stream as any, 200, {
-      'Content-Type': 'video/mp4',
+      'Content-Type': isHls ? 'video/mp2t' : 'video/mp4',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Access-Control-Allow-Origin': '*',
       'Connection': 'keep-alive',
