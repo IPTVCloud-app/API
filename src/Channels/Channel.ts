@@ -79,8 +79,9 @@ async function checkStreamStatus(url: string): Promise<string> {
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
 
   try {
+    // 1. Try HEAD request first (efficient)
     const res = await axios.head(url, { 
-      timeout: 1500, 
+      timeout: 2500, // Increased timeout
       headers: { 'User-Agent': 'Mozilla/5.0' },
       validateStatus: (status) => status >= 200 && status < 500
     });
@@ -90,17 +91,41 @@ async function checkStreamStatus(url: string): Promise<string> {
       status = 'geo-blocked';
     } else if (res.status < 400) {
       status = 'online';
+    } else {
+      // 2. Fallback to GET for common error codes (some block HEAD but allow GET)
+      try {
+        await axios.get(url, { 
+          timeout: 2500, 
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+          validateStatus: (status) => status >= 200 && status < 400
+        });
+        status = 'online';
+      } catch (e) {}
     }
     
     statusCache.set(url, { status, time: Date.now() });
     return status;
   } catch (err: any) {
-    if (err.response?.status === 403) {
+    const errStatus = err.response?.status;
+    if (errStatus === 403) {
       statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
       return 'geo-blocked';
     }
-    statusCache.set(url, { status: 'offline', time: Date.now() });
-    return 'offline';
+    
+    // Attempt one last GET fallback on generic error
+    try {
+      await axios.get(url, { 
+        timeout: 2500, 
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+        validateStatus: (status) => status >= 200 && status < 400
+      });
+      statusCache.set(url, { status: 'online', time: Date.now() });
+      return 'online';
+    } catch (e: any) {
+      const finalStatus = e.response?.status === 403 ? 'geo-blocked' : 'offline';
+      statusCache.set(url, { status: finalStatus, time: Date.now() });
+      return finalStatus;
+    }
   }
 }
 
@@ -315,6 +340,7 @@ router.get('/stream', async (c) => {
       let mediaPlaylistUrl = selected.url;
       let congestionCount = 0;
       let isClosed = false;
+      let totalTimeOffset = 0; // Tracks accumulated time for continuous timeline
 
       // Recursive Resolution to find actual Media Playlist (Fast-tracked)
       const resolveToMediaPlaylist = async (url: string): Promise<string> => {
@@ -335,7 +361,7 @@ router.get('/stream', async (c) => {
       mediaPlaylistUrl = await resolveToMediaPlaylist(mediaPlaylistUrl);
 
       const transmuxer = new muxjs.mp4.Transmuxer({
-        keepOriginalTimestamps: true,
+        keepOriginalTimestamps: false, // We manage timestamps for continuity
         baseMediaDecodeTime: 0
       });
 
@@ -365,7 +391,7 @@ router.get('/stream', async (c) => {
       });
 
       const sentSegments = new Set<string>();
-      interface QueueItem { url: string, data: Buffer | null }
+      interface QueueItem { url: string, data: Buffer | null, duration: number }
       const segmentQueue: QueueItem[] = [];
       const MAX_QUEUE = 3;
 
@@ -373,30 +399,32 @@ router.get('/stream', async (c) => {
         if (isClosed) return;
         try {
           const { data: playlist } = await axios.get(mediaPlaylistUrl, { headers: { 'User-Agent': userAgent }, timeout: 2500 });
+          const lines = playlist.split('\n');
           const baseUrl = mediaPlaylistUrl.substring(0, mediaPlaylistUrl.lastIndexOf('/') + 1);
-          const segments = playlist.split('\n')
-            .filter((line: string) => line.trim() && !line.startsWith('#'))
-            .map((line: string) => {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('http')) return trimmed;
-              return new URL(trimmed, baseUrl).href;
-            })
-            .filter((url: string) => !url.toLowerCase().includes('.m3u8'));
+          
+          let currentDuration = 10; // Default segment duration in seconds
 
-          for (const segUrl of segments) {
-            if (sentSegments.has(segUrl) || isClosed) continue;
-            if (segmentQueue.length >= MAX_QUEUE) break;
-            if (!segmentQueue.find(s => s.url === segUrl)) {
-              const queueItem: QueueItem = { url: segUrl, data: null };
-              segmentQueue.push(queueItem);
-              axios.get(segUrl, { responseType: 'arraybuffer', headers: { 'User-Agent': userAgent }, timeout: 5000 })
-                .then(res => {
-                  if (isClosed) return;
-                  queueItem.data = Buffer.from(res.data);
-                }).catch(() => {
-                  const idx = segmentQueue.findIndex(s => s.url === segUrl);
-                  if (idx !== -1) segmentQueue.splice(idx, 1);
-                });
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.startsWith('#EXTINF:')) {
+              currentDuration = parseFloat(line.split(':')[1]) || 10;
+            } else if (line && !line.startsWith('#')) {
+              const segUrl = line.startsWith('http') ? line : new URL(line, baseUrl).href;
+              
+              if (sentSegments.has(segUrl) || isClosed) continue;
+              if (segmentQueue.length >= MAX_QUEUE) break;
+              if (!segmentQueue.find(s => s.url === segUrl)) {
+                const queueItem: QueueItem = { url: segUrl, data: null, duration: currentDuration };
+                segmentQueue.push(queueItem);
+                axios.get(segUrl, { responseType: 'arraybuffer', headers: { 'User-Agent': userAgent }, timeout: 5000 })
+                  .then(res => {
+                    if (isClosed) return;
+                    queueItem.data = Buffer.from(res.data);
+                  }).catch(() => {
+                    const idx = segmentQueue.findIndex(s => s.url === segUrl);
+                    if (idx !== -1) segmentQueue.splice(idx, 1);
+                  });
+              }
             }
           }
         } catch (e) {}
@@ -406,7 +434,7 @@ router.get('/stream', async (c) => {
         isClosed = true;
       });
 
-      // Keep Vercel alive while waiting for source
+      // Keep Vercel alive
       const keepAliveInterval = setInterval(() => {
         if (isClosed || initSegmentSent) {
           clearInterval(keepAliveInterval);
@@ -420,7 +448,12 @@ router.get('/stream', async (c) => {
         if (segmentQueue.length > 0 && segmentQueue[0].data) {
           const item = segmentQueue.shift()!;
           if (item.data) {
-            console.log(`[Stream] Processing segment: ${item.url.substring(item.url.lastIndexOf('/') + 1)}`);
+            console.log(`[Stream] Processing segment: ${item.url.substring(item.url.lastIndexOf('/') + 1)} (${item.duration}s)`);
+            
+            // Set decode time for continuous timeline (90kHz units for TS)
+            transmuxer.setBaseMediaDecodeTime(totalTimeOffset * 90000);
+            totalTimeOffset += item.duration;
+
             transmuxer.push(new Uint8Array(item.data));
             transmuxer.flush();
           }

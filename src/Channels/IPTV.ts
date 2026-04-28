@@ -36,13 +36,13 @@ async function getCachedData(endpoint: string) {
  */
 async function checkStreamStatus(url: string): Promise<string> {
   if (!url) return 'offline';
-  
   const cached = statusCache.get(url);
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
 
   try {
+    // 1. Try HEAD request first (efficient)
     const res = await axios.head(url, { 
-      timeout: 1500, 
+      timeout: 2500,
       headers: { 'User-Agent': 'Mozilla/5.0' },
       validateStatus: (status) => status >= 200 && status < 500
     });
@@ -52,29 +52,40 @@ async function checkStreamStatus(url: string): Promise<string> {
       status = 'geo-blocked';
     } else if (res.status < 400) {
       status = 'online';
+    } else {
+      // 2. Fallback to GET for common error codes (some block HEAD but allow GET)
+      try {
+        await axios.get(url, { 
+          timeout: 2500, 
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+          validateStatus: (status) => status >= 200 && status < 400
+        });
+        status = 'online';
+      } catch (e) {}
     }
     
     statusCache.set(url, { status, time: Date.now() });
     return status;
   } catch (err: any) {
-    if (err.response?.status === 403) {
+    const errStatus = err.response?.status;
+    if (errStatus === 403) {
       statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
       return 'geo-blocked';
     }
     
-    // Fallback for streams that block HEAD but allow GET
+    // Attempt one last GET fallback on generic error
     try {
       await axios.get(url, { 
-        timeout: 1500, 
+        timeout: 2500, 
         headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
         validateStatus: (status) => status >= 200 && status < 400
       });
       statusCache.set(url, { status: 'online', time: Date.now() });
       return 'online';
     } catch (e: any) {
-      const status = e.response?.status === 403 ? 'geo-blocked' : 'offline';
-      statusCache.set(url, { status, time: Date.now() });
-      return status;
+      const finalStatus = e.response?.status === 403 ? 'geo-blocked' : 'offline';
+      statusCache.set(url, { status: finalStatus, time: Date.now() });
+      return finalStatus;
     }
   }
 }

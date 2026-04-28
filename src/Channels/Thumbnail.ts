@@ -88,34 +88,49 @@ router.get('/', async (c) => {
     }
 
     // 4. Fetch and Process
-    const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 5000 });
-    const buffer = Buffer.from(response.data);
-
-    const sharpInstance = sharp(buffer);
-    
-    if (isLogoMode) {
-      // 1. High Quality Logo - NO RESIZING
-      // We only convert to WebP and optimize to prevent ANY distortion
-      await sharpInstance
-        .webp({ quality: 95, lossless: true }) // Higher quality, preserving every detail
-        .toFile(thumbPath);
-    } else {
-      // 2. Optimized Thumbnail - PRESERVE ASPECT RATIO
-      // We use 'contain' with a transparent background so the logo is NEVER stretched or cropped
-      await sharpInstance
-        .resize(400, 400, { 
-          fit: 'contain', 
-          background: { r: 0, g: 0, b: 0, alpha: 0 } 
-        })
-        .webp({ quality: 80 })
-        .toFile(thumbPath);
+    let response;
+    try {
+      response = await axios.get(logoUrl, { 
+        responseType: 'arraybuffer', 
+        timeout: 8000,
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+    } catch (fetchError) {
+      console.error(`[Thumbnail] Failed to fetch logo from ${logoUrl}:`, fetchError);
+      return c.redirect(logoUrl); // Fallback to original URL if fetch fails
     }
 
-    const fileBuffer = fs.readFileSync(thumbPath);
-    return c.body(fileBuffer, 200, {
-      'Content-Type': 'image/webp',
-      'Cache-Control': 'public, max-age=86400'
-    });
+    const buffer = Buffer.from(response.data);
+
+    try {
+      const sharpInstance = sharp(buffer);
+      
+      if (isLogoMode) {
+        // 1. High Quality Logo - NO RESIZING
+        await sharpInstance
+          .webp({ quality: 95, lossless: true })
+          .toFile(thumbPath);
+      } else {
+        // 2. Optimized Thumbnail - PRESERVE ASPECT RATIO
+        await sharpInstance
+          .resize(400, 400, { 
+            fit: 'contain', 
+            background: { r: 0, g: 0, b: 0, alpha: 0 } 
+          })
+          .webp({ quality: 80 })
+          .toFile(thumbPath);
+      }
+
+      const fileBuffer = fs.readFileSync(thumbPath);
+      return c.body(fileBuffer, 200, {
+        'Content-Type': 'image/webp',
+        'Cache-Control': 'public, max-age=86400'
+      });
+    } catch (sharpError) {
+      console.error('[Thumbnail] Sharp processing failed, falling back to original:', sharpError);
+      // If Sharp fails (e.g. unsupported format), redirect to original logo
+      return c.redirect(logoUrl);
+    }
 
   } catch (error) {
     console.error('Image processing error:', error);
