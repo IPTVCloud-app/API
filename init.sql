@@ -129,6 +129,27 @@ CREATE TABLE IF NOT EXISTS site_analytics (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 12. Playlists Table
+CREATE TABLE IF NOT EXISTS playlists (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_public BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 13. Playlist Items Table
+CREATE TABLE IF NOT EXISTS playlist_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    playlist_id UUID REFERENCES playlists(id) ON DELETE CASCADE,
+    channel_short_id TEXT REFERENCES channel_mappings(short_id) ON DELETE CASCADE,
+    position_order INTEGER NOT NULL DEFAULT 0,
+    added_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(playlist_id, channel_short_id)
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -139,3 +160,5 @@ CREATE INDEX IF NOT EXISTS idx_watch_history_user_id ON watch_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_comments_channel_id ON comments(channel_short_id);
 CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments(user_id);
 CREATE INDEX IF NOT EXISTS idx_site_analytics_event_type ON site_analytics(event_type);
+CREATE INDEX IF NOT EXISTS idx_playlists_user_id ON playlists(user_id);
+CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_id ON playlist_items(playlist_id);

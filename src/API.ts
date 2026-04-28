@@ -23,6 +23,7 @@ import adminDashboard from './Admin/Dashboard.js';
 import adminUsers from './Admin/Users.js';
 import comments from './Channels/Comments.js';
 import iptv from './Channels/IPTV.js';
+import playlists from './Channels/Playlists.js';
 
 // Core Imports
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
@@ -108,6 +109,7 @@ app.route('/api/channels/logo', logo);
 app.route('/api/channels/meta', metadata); // New base for categories, languages, etc.
 app.route('/api/channels', iptv);
 app.route('/api/channels', channels);
+app.route('/api/playlists', playlists);
 
 app.route('/api/channels/comments', comments);
 app.route('/api/social/profile', profile);
