@@ -177,9 +177,10 @@ async function getStreamIndex() {
     const response = await axios.get(STREAMS_URL);
     response.data.forEach((s: any) => {
       if (!s.channel) return;
-      const list = newIndex.get(s.channel) || [];
+      const key = s.channel.toLowerCase(); // Normalize key
+      const list = newIndex.get(key) || [];
       list.push({ url: s.url, quality: s.quality || 'SD', user_agent: s.user_agent || null });
-      newIndex.set(s.channel, list);
+      newIndex.set(key, list);
     });
     for (const [id, streams] of newIndex.entries()) {
       newIndex.set(id, streams.sort((a, b) => getQualityWeight(b.quality) - getQualityWeight(a.quality)));
@@ -280,20 +281,12 @@ router.get('/stream', async (c) => {
     const streams = await getStreamIndex();
     
     // Improved Case-Insensitive Lookup
-    const targetId = (origId || id).toLowerCase();
-    let chStreams = streams.get(origId || id) || [];
-    
-    if (chStreams.length === 0) {
-      for (const [key, list] of streams.entries()) {
-        if (key.toLowerCase() === targetId) {
-          chStreams = list;
-          break;
-        }
-      }
-    }
+    const searchId = (origId || id).toLowerCase();
+    let chStreams = streams.get(searchId) || [];
 
     if (chStreams.length === 0) return c.json({ error: 'No streams found for this channel' }, 404);
     
+    // Permissive Filter: Fallback to all streams if no low-res ones pass
     let allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
     if (allowed.length === 0) allowed = chStreams; 
 
@@ -314,12 +307,12 @@ router.get('/stream', async (c) => {
 
     if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
     
-    const channelKey = `${id}_${sel.quality}`;
+    const channelKey = `${searchId}_${sel.quality}`; // Normalized key
     const shared = await getShared(channelKey, sel.url, ua);
 
     // CRITICAL: Wait for initSegment
     let waitCount = 0;
-    while (!shared.initSegment && waitCount < 15) {
+    while (!shared.initSegment && waitCount < 20) {
       await new Promise(r => setTimeout(r, 500));
       waitCount++;
     }
@@ -407,7 +400,7 @@ router.get('/', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
   const offset = parseInt(c.req.query('offset') || '0', 10);
   
-  // Case-insensitive query parameters
+  // Robust Case-Insensitive Parameters
   const query = c.req.query();
   const getParam = (key: string) => {
     const k = key.toLowerCase();
@@ -443,9 +436,12 @@ router.get('/', async (c) => {
     
     const results = await Promise.all(channels.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
-      const chStreams = streams.get(ch.id) || [];
+      
+      // Use normalized index
+      const chStreams = streams.get(ch.id.toLowerCase()) || [];
       const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-      const primaryUrl = allowed.length > 0 ? allowed[0].url : null;
+      const primaryUrl = allowed.length > 0 ? allowed[0].url : (chStreams.length > 0 ? chStreams[0].url : null);
+      
       const status = await checkStreamStatus(primaryUrl);
 
       return { 
@@ -453,7 +449,9 @@ router.get('/', async (c) => {
         stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
         thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
         logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
-        status, available_resolutions: allowed.map((s: any) => s.quality), abr_supported: allowed.length > 1
+        status, 
+        available_resolutions: allowed.map((s: any) => s.quality), 
+        abr_supported: allowed.length > 1
       };
     }));
     return c.json(results);
@@ -510,6 +508,8 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               if (filters.subdivision && ch.subdivision !== filters.subdivision) continue;
               if (filters.region && meta.countries.get(ch.country)?.region !== filters.region) continue;
 
+              // Use normalized lookup in segmented fetch too
+              const chStreams = streams.get(ch.id.toLowerCase()) || [];
               const matchesSearch = !searchLower || 
                 ch.name?.toLowerCase().includes(searchLower) || 
                 ch.id?.toLowerCase().includes(searchLower) ||
@@ -520,7 +520,6 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               if (!matchesSearch) continue;
               if (matchesFound < offset) { matchesFound++; } 
               else {
-                const chStreams = streams.get(ch.id) || [];
                 const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
                 const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
                 const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
