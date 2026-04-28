@@ -39,12 +39,12 @@ router.get('/', async (c) => {
 
   try {
     const filters = { 
-      category: category?.toString(), 
-      language: language?.toString(), 
-      country: country?.toString(), 
-      city: city?.toString(), 
-      subdivision: subdivision?.toString(), 
-      region: region?.toString() 
+      category: category?.toString().toLowerCase(), 
+      language: language?.toString().toLowerCase(), 
+      country: country?.toString().toLowerCase(), 
+      city: city?.toString().toLowerCase(), 
+      subdivision: subdivision?.toString().toLowerCase(), 
+      region: region?.toString().toLowerCase() 
     };
     
     const channels = await fetchChannelsSegmented(offset, limit, baseUrl, search?.toString(), filters);
@@ -116,12 +116,12 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
             try {
               const ch = JSON.parse(currentObject);
               
-              if (filters.category && !ch.categories?.includes(filters.category)) continue;
-              if (filters.language && !ch.languages?.includes(filters.language)) continue;
-              if (filters.country && ch.country !== filters.country) continue;
-              if (filters.city && ch.city !== filters.city) continue;
-              if (filters.subdivision && ch.subdivision !== filters.subdivision) continue;
-              if (filters.region && meta.countries.get(ch.country)?.region !== filters.region) continue;
+              if (filters.category && !ch.categories?.some((cat: string) => cat.toLowerCase() === filters.category)) continue;
+              if (filters.language && !ch.languages?.some((lang: string) => lang.toLowerCase() === filters.language)) continue;
+              if (filters.country && ch.country?.toLowerCase() !== filters.country) continue;
+              if (filters.city && ch.city?.toLowerCase() !== filters.city) continue;
+              if (filters.subdivision && ch.subdivision?.toLowerCase() !== filters.subdivision) continue;
+              if (filters.region && meta.countries.get(ch.country)?.region?.toLowerCase() !== filters.region) continue;
 
               const chStreams = streams.get(ch.id.toLowerCase()) || [];
               const matchesSearch = !searchLower || 

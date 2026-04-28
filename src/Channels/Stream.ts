@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import axios from 'axios';
+import { getCookie, setCookie } from 'hono/cookie';
 // @ts-expect-error - mux.js doesn't have official types
 import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
@@ -75,7 +76,8 @@ async function fetchPlaylist(url: string, ua: string) {
     
     let mediaUrl = url;
     if (!content.includes('#EXT-X-TARGETDURATION')) {
-      const first = content.split('\n').find((l: string) => l.trim() && !l.startsWith('#') && l.toLowerCase().includes('.m3u8'));
+      const lines = content.split('\n');
+      const first = lines.find((l: string) => l.trim() && !l.startsWith('#') && l.toLowerCase().includes('.m3u8'));
       if (first) {
         mediaUrl = first.trim().startsWith('http') ? first.trim() : new URL(first.trim(), url.substring(0, url.lastIndexOf('/') + 1)).href;
       }
@@ -89,25 +91,30 @@ async function fetchPlaylist(url: string, ua: string) {
 }
 
 /**
- * Parse Media Playlist to get segments and target duration
+ * Parse Media Playlist to get segments, target duration and sequence
  */
 function parseMediaPlaylist(content: string, baseUrl: string) {
   const lines = content.split('\n');
   let targetDuration = 6;
-  const segments: { url: string; duration: number }[] = [];
+  let mediaSequence = 0;
+  const segments: { url: string; duration: number; seq: number }[] = [];
   let curDur = 6;
+  let seqCounter = 0;
 
   for (const line of lines) {
     if (line.startsWith('#EXT-X-TARGETDURATION:')) {
       targetDuration = parseInt(line.split(':')[1], 10) || 6;
+    } else if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      mediaSequence = parseInt(line.split(':')[1], 10) || 0;
+      seqCounter = mediaSequence;
     } else if (line.startsWith('#EXTINF:')) {
       curDur = parseFloat(line.split(':')[1]) || 6;
     } else if (line.trim() && !line.startsWith('#')) {
       const url = line.trim().startsWith('http') ? line.trim() : new URL(line.trim(), baseUrl).href;
-      segments.push({ url, duration: curDur });
+      segments.push({ url, duration: curDur, seq: seqCounter++ });
     }
   }
-  return { targetDuration, segments };
+  return { targetDuration, segments, mediaSequence };
 }
 
 /**
@@ -151,20 +158,34 @@ router.get('/', async (c) => {
     
     const channelKey = `${searchId}_${sel.quality}`.toLowerCase();
 
+    // Continuity state from browser cookies
+    const cookieKey = `stream_pos_${channelKey}`;
+    const savedPos = getCookie(c, cookieKey);
+    let initialOffset = 0;
+    let lastSeq = -1;
+
+    if (savedPos) {
+      try {
+        const parts = savedPos.split(':');
+        initialOffset = parseFloat(parts[0]) || 0;
+        lastSeq = parseInt(parts[1], 10) || -1;
+      } catch (e) {}
+    }
+
     const headers = new Headers();
     headers.set('Content-Type', 'video/mp4');
     headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     headers.set('Connection', 'keep-alive');
     headers.set('X-Content-Type-Options', 'nosniff');
     headers.set('Access-Control-Allow-Origin', '*');
-    headers.set('X-Accel-Buffering', 'no'); // Vercel optimization: Disable proxy buffering
+    headers.set('X-Accel-Buffering', 'no'); // Vercel optimization
 
     const signal = c.req.raw.signal;
 
     const stream = new ReadableStream({
       async start(controller) {
-        let transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
-        let offset = 0;
+        let transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: initialOffset * 90000 });
+        let offset = initialOffset;
         let sentSegments = new Set<string>();
         let cached = getCached(channelKey);
         let mediaPlaylistUrl = cached?.mediaPlaylistUrl || sel.url;
@@ -188,12 +209,11 @@ router.get('/', async (c) => {
           if (e.data) {
             try {
               controller.enqueue(new Uint8Array(e.data));
-            } catch (err) {
-              // controller likely closed
-            }
+            } catch (err) {}
           }
         });
 
+        // 1. Send Init Segment immediately
         if (initSegment) {
           controller.enqueue(initSegment);
         }
@@ -212,10 +232,14 @@ router.get('/', async (c) => {
             targetDuration = td;
             setCached(channelKey, { targetDuration, mediaPlaylistUrl });
 
-            const fresh = segments.filter(s => !sentSegments.has(s.url));
+            // 2. Identify new segments based on sequence and URL
+            const fresh = segments.filter(s => s.seq > lastSeq && !sentSegments.has(s.url));
 
             if (fresh.length > 0) {
-              for (const seg of fresh) {
+              // Pre-buffer: if we are just starting, send up to 3 segments at once
+              const toSend = lastSeq === -1 ? fresh.slice(-3) : fresh;
+
+              for (const seg of toSend) {
                 if (signal.aborted) break;
                 
                 try {
@@ -225,25 +249,30 @@ router.get('/', async (c) => {
                     timeout: 8000 
                   });
                   
+                  // CRITICAL: Precise continuous timestamps
                   transmuxer.setBaseMediaDecodeTime(offset * 90000);
-                  offset += seg.duration;
                   transmuxer.push(new Uint8Array(res.data));
                   transmuxer.flush();
                   
+                  offset += seg.duration;
+                  lastSeq = seg.seq;
                   sentSegments.add(seg.url);
-                  
-                  if (sentSegments.size > 50) {
-                     const toDelete = Array.from(sentSegments).slice(0, sentSegments.size - 20);
-                     toDelete.forEach(k => sentSegments.delete(k));
-                  }
-                } catch (e) {
-                  // Segment download failed, skip
-                }
+
+                  // Update browser storage via Set-Cookie (simulated via header if possible, or just local state)
+                  // Note: In a streaming response, we can't easily update cookies after headers are sent.
+                  // We rely on the fact that if the function crashes, the next request will use the initial cookies.
+                } catch (e) {}
               }
             }
 
+            // 3. Heartbeat: Send a tiny MP4 "free" atom to keep the connection alive if no new data
+            if (!signal.aborted && fresh.length === 0) {
+               try { controller.enqueue(new Uint8Array([0, 0, 0, 8, 102, 114, 101, 101])); } catch (e) {}
+            }
+
             if (!signal.aborted) {
-              const waitTime = fresh.length === 0 ? (targetDuration / 2) * 1000 : targetDuration * 1000;
+              // Aggressive polling: wait half target duration to avoid starvation
+              const waitTime = Math.max(1000, (targetDuration / 2) * 1000);
               await new Promise(r => setTimeout(r, waitTime));
             }
           }
@@ -256,6 +285,11 @@ router.get('/', async (c) => {
         }
       }
     });
+
+    // We set the initial cookie for the NEXT reconnection
+    // This isn't perfect for live updates, but it's the only way in serverless
+    // to "store in the browser" without a client-side database.
+    setCookie(c, cookieKey, `${initialOffset}:${lastSeq}`, { maxAge: 3600, path: '/' });
 
     return new Response(stream, { headers });
   } catch (error) { return c.json({ error: 'Stream failure' }, 500); }
