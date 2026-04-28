@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { nanoid } from 'nanoid';
 import axios from 'axios';
-// @ts-ignore
+// @ts-expect-error - mux.js doesn't have official types
 import muxjs from 'mux.js';
 import { supabase } from '../Database/DB.js';
 import { Readable } from 'stream';
@@ -19,7 +19,12 @@ const TIMEZONES_URL = 'https://iptv-org.github.io/api/timezones.json';
 
 // Persistent caches
 let streamIndex: Map<string, any[]> | null = null;
-let metadataMaps: any = null;
+let metadataMaps: {
+  countries: Map<string, any>;
+  languages: Map<string, string>;
+  regions: Map<string, string>;
+  timezones: Map<string, string[]>;
+} | null = null;
 let lastIndexLoad = 0;
 const INDEX_TTL = 1000 * 60 * 60; // 1 hour
 
@@ -43,7 +48,7 @@ async function getMetadataMaps() {
     ]);
 
     const countryToTz = new Map<string, string[]>();
-    tz.forEach((t: any) => {
+    tz.forEach((t: { code?: string; countries?: string[] }) => {
       t.countries?.forEach((code: string) => {
         const list = countryToTz.get(code) || [];
         if (t.code) list.push(t.code);
@@ -52,9 +57,9 @@ async function getMetadataMaps() {
     });
 
     metadataMaps = {
-      countries: new Map(cnt.map((c: any) => [c.code, c])),
-      languages: new Map(lng.map((l: any) => [l.code, l.name])),
-      regions: new Map(reg.map((r: any) => [r.code, r.name])),
+      countries: new Map(cnt.map((c: { code: string }) => [c.code, c])),
+      languages: new Map(lng.map((l: { code: string; name: string }) => [l.code, l.name])),
+      regions: new Map(reg.map((r: { code: string; name: string }) => [r.code, r.name])),
       timezones: countryToTz
     };
     return metadataMaps;
@@ -308,7 +313,8 @@ router.get('/stream', async (c) => {
     let isClosed = false;
 
     // Fast Loading: Pre-fetch queue
-    const segmentQueue: { url: string, data: Buffer | null }[] = [];
+    interface QueueItem { url: string, data: Buffer | null }
+    const segmentQueue: QueueItem[] = [];
     const MAX_QUEUE = 3;
 
     const fillQueue = async (m3u8Url: string) => {
@@ -333,7 +339,7 @@ router.get('/stream', async (c) => {
           if (segmentQueue.length >= MAX_QUEUE) break;
           
           if (!segmentQueue.find(s => s.url === segUrl)) {
-            const queueItem = { url: segUrl, data: null };
+            const queueItem: QueueItem = { url: segUrl, data: null };
             segmentQueue.push(queueItem);
             
             axios.get(segUrl, { 
@@ -358,8 +364,10 @@ router.get('/stream', async (c) => {
 
         if (segmentQueue.length > 0 && segmentQueue[0].data) {
           const item = segmentQueue.shift()!;
-          transmuxer.push(new Uint8Array(item.data));
-          transmuxer.flush();
+          if (item.data) {
+            transmuxer.push(new Uint8Array(item.data));
+            transmuxer.flush();
+          }
           sentSegments.add(item.url);
           
           if (sentSegments.size > 50) {
