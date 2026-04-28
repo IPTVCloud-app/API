@@ -33,6 +33,7 @@ router.get('/', async (c) => {
   const city = getParam('city');
   const subdivision = getParam('subdivision');
   const region = getParam('region');
+  const status = getParam('status');
 
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const baseUrl = `${protocol}://${c.req.header('host')}`;
@@ -44,7 +45,8 @@ router.get('/', async (c) => {
       country: country?.toString().toLowerCase(), 
       city: city?.toString().toLowerCase(), 
       subdivision: subdivision?.toString().toLowerCase(), 
-      region: region?.toString().toLowerCase() 
+      region: region?.toString().toLowerCase(),
+      status: status?.toString().toLowerCase()
     };
     
     const channels = await fetchChannelsSegmented(offset, limit, baseUrl, search?.toString(), filters);
@@ -55,16 +57,17 @@ router.get('/', async (c) => {
       
       const chStreams = streams.get(ch.id.toLowerCase()) || [];
       const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-      const primaryUrl = allowed.length > 0 ? allowed[0].url : (chStreams.length > 0 ? chStreams[0].url : null);
       
-      const status = await checkStreamStatus(primaryUrl);
+      // Status is already checked inside fetchChannelsSegmented if filters.status exists, 
+      // otherwise we check it here for the payload.
+      const statusValue = ch.status || await checkStreamStatus(allowed.length > 0 ? allowed[0].url : (chStreams.length > 0 ? chStreams[0].url : null));
 
       return { 
         ...ch, id: shortId, original_id: ch.id, 
         stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
         thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
         logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
-        status, 
+        status: statusValue, 
         available_resolutions: allowed.map((s: any) => s.quality), 
         abr_supported: allowed.length > 1
       };
@@ -87,8 +90,10 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
   const streams = await getStreamIndex();
   const meta = await getMetadataMaps();
   const searchLower = search?.toLowerCase();
+  
   const response = await axios({ method: 'get', url: CHANNELS_URL, responseType: 'stream' });
   const streamData = response.data as Readable;
+  
   const results: any[] = [];
   let currentObject = '';
   let bracketDepth = 0;
@@ -96,64 +101,80 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
   let inString = false;
   let isEscaped = false;
 
-  return new Promise<any[]>((resolve, reject) => {
-    streamData.on('data', (chunk: Buffer) => {
-      const str = chunk.toString();
-      for (let i = 0; i < str.length; i++) {
-        const char = str[i];
-        if (inString) {
-          currentObject += char;
-          if (isEscaped) isEscaped = false;
-          else if (char === '\\') isEscaped = true;
-          else if (char === '"') inString = false;
-          continue;
-        }
-        if (char === '"') { inString = true; currentObject += char; continue; }
-        if (char === '{') { if (bracketDepth === 0) currentObject = ''; bracketDepth++; currentObject += char; } 
-        else if (char === '}') {
-          bracketDepth--; currentObject += char;
-          if (bracketDepth === 0) {
-            try {
-              const ch = JSON.parse(currentObject);
-              
-              if (filters.category && !ch.categories?.some((cat: string) => cat.toLowerCase() === filters.category)) continue;
-              if (filters.language && !ch.languages?.some((lang: string) => lang.toLowerCase() === filters.language)) continue;
-              if (filters.country && ch.country?.toLowerCase() !== filters.country) continue;
-              if (filters.city && ch.city?.toLowerCase() !== filters.city) continue;
-              if (filters.subdivision && ch.subdivision?.toLowerCase() !== filters.subdivision) continue;
-              if (filters.region && meta.countries.get(ch.country)?.region?.toLowerCase() !== filters.region) continue;
-
-              const chStreams = streams.get(ch.id.toLowerCase()) || [];
-              const matchesSearch = !searchLower || 
-                ch.name?.toLowerCase().includes(searchLower) || 
-                ch.id?.toLowerCase().includes(searchLower) ||
-                ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower)) ||
-                ch.country?.toLowerCase().includes(searchLower) ||
-                ch.city?.toLowerCase().includes(searchLower);
-
-              if (!matchesSearch) continue;
-              if (matchesFound < offset) { matchesFound++; } 
-              else {
-                const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
-                const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-                const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
-
-                results.push({
-                  ...ch, country_name: meta.countries.get(ch.country)?.name || null, 
-                  region: meta.countries.get(ch.country)?.region || null,
-                  languages_names: langNames, geo_blocked: isGeoBlocked,
-                  highest_allowed_quality: allowed.length > 0 ? allowed[0].quality : null
-                });
-                if (results.length >= limit) { streamData.destroy(); resolve(results); return; }
-              }
-            } catch (e) {}
-          }
-        } else if (bracketDepth > 0) currentObject += char;
+  for await (const chunk of streamData) {
+    const str = chunk.toString();
+    for (let i = 0; i < str.length; i++) {
+      const char = str[i];
+      if (inString) {
+        currentObject += char;
+        if (isEscaped) isEscaped = false;
+        else if (char === '\\') isEscaped = true;
+        else if (char === '"') inString = false;
+        continue;
       }
-    });
-    streamData.on('end', () => resolve(results));
-    streamData.on('error', (err) => reject(err));
-  });
+      if (char === '"') { inString = true; currentObject += char; continue; }
+      if (char === '{') { if (bracketDepth === 0) currentObject = ''; bracketDepth++; currentObject += char; } 
+      else if (char === '}') {
+        bracketDepth--; currentObject += char;
+        if (bracketDepth === 0) {
+          try {
+            const ch = JSON.parse(currentObject);
+            
+            // Metadata Filters
+            if (filters.category && !ch.categories?.some((cat: string) => cat.toLowerCase() === filters.category)) continue;
+            if (filters.language && !ch.languages?.some((lang: string) => lang.toLowerCase() === filters.language)) continue;
+            if (filters.country && ch.country?.toLowerCase() !== filters.country) continue;
+            if (filters.city && ch.city?.toLowerCase() !== filters.city) continue;
+            if (filters.subdivision && ch.subdivision?.toLowerCase() !== filters.subdivision) continue;
+            if (filters.region && meta.countries.get(ch.country)?.region?.toLowerCase() !== filters.region) continue;
+
+            const chStreams = streams.get(ch.id.toLowerCase()) || [];
+            
+            // Search Filter
+            const matchesSearch = !searchLower || 
+              ch.name?.toLowerCase().includes(searchLower) || 
+              ch.id?.toLowerCase().includes(searchLower) ||
+              ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower)) ||
+              ch.country?.toLowerCase().includes(searchLower) ||
+              ch.city?.toLowerCase().includes(searchLower);
+
+            if (!matchesSearch) continue;
+
+            // Resolve Status if filter is present
+            let chStatus = null;
+            if (filters.status) {
+              const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+              const primaryUrl = allowed.length > 0 ? allowed[0].url : (chStreams.length > 0 ? chStreams[0].url : null);
+              chStatus = await checkStreamStatus(primaryUrl);
+              if (chStatus !== filters.status) continue;
+            }
+
+            // Pagination
+            if (matchesFound < offset) { matchesFound++; } 
+            else {
+              const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
+              const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+              const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
+
+              results.push({
+                ...ch, country_name: meta.countries.get(ch.country)?.name || null, 
+                region: meta.countries.get(ch.country)?.region || null,
+                languages_names: langNames, geo_blocked: isGeoBlocked,
+                highest_allowed_quality: allowed.length > 0 ? allowed[0].quality : null,
+                status: chStatus // Pass status forward if we already resolved it
+              });
+              
+              if (results.length >= limit) {
+                streamData.destroy();
+                return results;
+              }
+            }
+          } catch (e) {}
+        }
+      } else if (bracketDepth > 0) currentObject += char;
+    }
+  }
+  return results;
 }
 
 export default router;

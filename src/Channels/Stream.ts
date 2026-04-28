@@ -1,7 +1,5 @@
 import { Hono } from 'hono';
 import axios from 'axios';
-// @ts-expect-error
-import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
@@ -31,7 +29,7 @@ function isQualityTooHigh(q: string) {
   return getQualityWeight(q) > 100;
 }
 
-async function getStreamIndex() {
+export async function getStreamIndex() {
   const now = Date.now();
 
   if (streamIndex && now - lastIndexLoad < INDEX_TTL) {
@@ -47,7 +45,6 @@ async function getStreamIndex() {
       if (!s.channel) return;
 
       const key = String(s.channel).toLowerCase();
-
       const arr = map.get(key) || [];
 
       arr.push({
@@ -76,300 +73,134 @@ async function getStreamIndex() {
 }
 
 /* -------------------------------------------------------
-   HELPERS
+   HLS PROXY HELPERS
 ------------------------------------------------------- */
 
-async function fetchText(url: string, ua: string) {
-  const { data } = await axios.get(url, {
-    timeout: 8000,
-    responseType: 'text',
-    headers: { 'User-Agent': ua }
-  });
-
-  return data as string;
-}
-
-async function resolveMediaPlaylist(url: string, ua: string) {
-  const text = await fetchText(url, ua);
-
-  // already media playlist
-  if (text.includes('#EXT-X-TARGETDURATION')) {
-    return {
-      url,
-      content: text
-    };
-  }
-
-  // master playlist
-  const lines = text.split('\n');
-
-  const picked = lines.find(
-    (l) =>
-      l.trim() &&
-      !l.startsWith('#') &&
-      l.toLowerCase().includes('.m3u8')
-  );
-
-  if (!picked) {
-    return {
-      url,
-      content: text
-    };
-  }
-
-  const nextUrl = picked.startsWith('http')
-    ? picked.trim()
-    : new URL(picked.trim(), url).href;
-
-  return {
-    url: nextUrl,
-    content: await fetchText(nextUrl, ua)
-  };
-}
-
-function parsePlaylist(content: string, baseUrl: string) {
-  const lines = content.split('\n');
-
-  let targetDuration = 6;
-  let mediaSequence = 0;
-  let duration = 6;
-  let seq = 0;
-
-  const segments: {
-    url: string;
-    duration: number;
-    seq: number;
-  }[] = [];
-
-  for (const line of lines) {
-    const l = line.trim();
-
-    if (!l) continue;
-
-    if (l.startsWith('#EXT-X-TARGETDURATION:')) {
-      targetDuration = Number(l.split(':')[1]) || 6;
-    } else if (l.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
-      mediaSequence = Number(l.split(':')[1]) || 0;
-      seq = mediaSequence;
-    } else if (l.startsWith('#EXTINF:')) {
-      duration = parseFloat(l.split(':')[1]) || 6;
-    } else if (!l.startsWith('#')) {
-      const abs = l.startsWith('http')
-        ? l
-        : new URL(l, baseUrl).href;
-
-      segments.push({
-        url: abs,
-        duration,
-        seq: seq++
+/**
+ * Rewrites M3U8 content to proxy segments and sub-playlists through our server
+ */
+function rewriteM3U8(content: string, sourceUrl: string, proxyBase: string, ua: string) {
+  const baseUrl = sourceUrl.substring(0, sourceUrl.lastIndexOf('/') + 1);
+  return content.split('\n').map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#EXT-X-VERSION') || trimmed.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
+      return line;
+    }
+    
+    // Rewrite URI attributes in tags (like EXT-X-KEY, EXT-X-MAP, etc.)
+    if (trimmed.startsWith('#')) {
+      return line.replace(/URI="([^"]+)"/g, (match, p1) => {
+        const abs = p1.startsWith('http') ? p1 : new URL(p1, baseUrl).href;
+        return `URI="${proxyBase}?url=${encodeURIComponent(abs)}&ua=${encodeURIComponent(ua)}"`;
       });
     }
-  }
 
-  return {
-    targetDuration,
-    mediaSequence,
-    segments
-  };
-}
-
-async function fetchSegment(url: string, ua: string) {
-  const { data } = await axios.get(url, {
-    timeout: 12000,
-    responseType: 'arraybuffer',
-    headers: { 'User-Agent': ua }
-  });
-
-  return new Uint8Array(data);
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+    // Rewrite segment or sub-playlist URLs
+    const abs = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).href;
+    return `${proxyBase}?url=${encodeURIComponent(abs)}&ua=${encodeURIComponent(ua)}`;
+  }).join('\n');
 }
 
 /* -------------------------------------------------------
-   LIVE STREAM ROUTE
+   ROUTES
 ------------------------------------------------------- */
 
+/**
+ * Universal HLS Proxy Route
+ * Proxies .m3u8, .ts, .key, etc.
+ */
+router.get('/proxy', async (c) => {
+  const url = c.req.query('url');
+  const ua = c.req.query('ua') || 'Mozilla/5.0';
+
+  if (!url) return c.text('URL required', 400);
+
+  const protocol = c.req.header('x-forwarded-proto') || 'http';
+  const host = c.req.header('host');
+  const proxyBase = `${protocol}://${host}/api/channels/stream/proxy`;
+
+  try {
+    const isPlaylist = url.toLowerCase().includes('.m3u8');
+    
+    if (isPlaylist) {
+      const { data } = await axios.get(url, { headers: { 'User-Agent': ua }, timeout: 10000 });
+      const rewritten = rewriteM3U8(data, url, proxyBase, ua);
+      
+      return c.text(rewritten, 200, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache'
+      });
+    } else {
+      // Proxy raw data (segments, keys, etc.)
+      const res = await axios.get(url, { 
+        responseType: 'stream', 
+        headers: { 'User-Agent': ua },
+        timeout: 15000 
+      });
+
+      const contentType = String(res.headers['content-type'] || 'application/octet-stream');
+      
+      return new Response(res.data, {
+        headers: {
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+  } catch (err) {
+    return c.text('Proxy error', 502);
+  }
+});
+
+/**
+ * Entry point: /api/channels/stream?id=...
+ */
 router.get('/', async (c) => {
   const id = c.req.query('id');
   const res = c.req.query('res') || 'auto';
 
-  if (!id) {
-    return c.json({ error: 'ID required' }, 400);
-  }
+  if (!id) return c.json({ error: 'ID required' }, 400);
 
   try {
     const originalId = await getOriginalId(id);
     const searchId = (originalId || id).toLowerCase();
 
     const index = await getStreamIndex();
-    let list = index.get(searchId) || [];
+    const list = index.get(searchId) || [];
 
-    if (!list.length) {
-      return c.json({ error: 'No streams found' }, 404);
-    }
+    if (!list.length) return c.json({ error: 'No streams found' }, 404);
 
-    let allowed = list.filter((s) => !isQualityTooHigh(s.quality));
+    let allowed = list.filter((s: any) => !isQualityTooHigh(s.quality));
     if (!allowed.length) allowed = list;
 
     let selected = allowed[0];
-
     if (res !== 'auto') {
-      const found = allowed.find((s) => s.quality === res);
+      const found = allowed.find((s: any) => s.quality === res);
       if (found) selected = found;
     }
 
     const ua = selected.user_agent || 'Mozilla/5.0';
+    const protocol = c.req.header('x-forwarded-proto') || 'http';
+    const host = c.req.header('host');
+    const proxyBase = `${protocol}://${host}/api/channels/stream/proxy`;
 
-    const status = await axios
-      .head(selected.url, {
-        timeout: 3000,
-        headers: { 'User-Agent': ua },
-        validateStatus: (s) => s >= 200 && s < 500
-      })
-      .then((r) =>
-        r.status === 403
-          ? 'geo-blocked'
-          : r.status < 400
-          ? 'online'
-          : 'offline'
-      )
-      .catch(() => 'online');
-
-    if (status === 'geo-blocked') {
-      return c.json({ error: 'Geo blocked' }, 403);
-    }
-
-    const signal = c.req.raw.signal;
-
-    const stream = new ReadableStream({
-      async start(controller) {
-        let closed = false;
-
-        signal.addEventListener('abort', () => {
-          closed = true;
-          try {
-            controller.close();
-          } catch {}
-        });
-
-        const transmuxer = new muxjs.mp4.Transmuxer({
-          keepOriginalTimestamps: true
-        });
-
-        let initSent = false;
-
-        transmuxer.on('data', (segment: any) => {
-          if (closed) return;
-
-          try {
-            // send init only once
-            if (!initSent && segment.initSegment) {
-              controller.enqueue(
-                new Uint8Array(segment.initSegment)
-              );
-              initSent = true;
-            }
-
-            if (segment.data) {
-              controller.enqueue(
-                new Uint8Array(segment.data)
-              );
-            }
-          } catch {
-            closed = true;
-          }
-        });
-
-        let mediaUrl = selected.url;
-        let lastSeq = -1;
-
-        try {
-          while (!closed) {
-            const playlist = await resolveMediaPlaylist(
-              mediaUrl,
-              ua
-            );
-
-            mediaUrl = playlist.url;
-
-            const baseUrl = mediaUrl.substring(
-              0,
-              mediaUrl.lastIndexOf('/') + 1
-            );
-
-            const parsed = parsePlaylist(
-              playlist.content,
-              baseUrl
-            );
-
-            // IMPORTANT:
-            // if first boot, start from last 2 segments
-            let fresh = parsed.segments.filter(
-              (s) => s.seq > lastSeq
-            );
-
-            if (lastSeq === -1 && fresh.length > 2) {
-              fresh = fresh.slice(-2);
-            }
-
-            if (fresh.length) {
-              for (const seg of fresh) {
-                if (closed) break;
-
-                try {
-                  const bytes = await fetchSegment(
-                    seg.url,
-                    ua
-                  );
-
-                  transmuxer.push(bytes);
-                  transmuxer.flush();
-
-                  lastSeq = seg.seq;
-                } catch {
-                  // skip bad segment
-                }
-              }
-            }
-
-            // wait for next live update
-            const wait =
-              Math.max(
-                1000,
-                (parsed.targetDuration * 1000) / 2
-              );
-
-            await sleep(wait);
-          }
-        } catch (err) {
-          if (!closed) {
-            try {
-              controller.error(err);
-            } catch {}
-          }
-        } finally {
-          try {
-            transmuxer.dispose();
-          } catch {}
-        }
-      }
+    // Fetch master playlist
+    const { data } = await axios.get(selected.url, { 
+      headers: { 'User-Agent': ua }, 
+      timeout: 10000,
+      responseType: 'text'
     });
+    const rewritten = rewriteM3U8(data, selected.url, proxyBase, ua);
 
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'video/mp4',
-        'Cache-Control':
-          'no-cache, no-store, must-revalidate',
-        Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'X-Content-Type-Options': 'nosniff',
-        'X-Accel-Buffering': 'no'
-      }
+    return c.text(rewritten, 200, {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
     });
-  } catch {
-    return c.json({ error: 'Stream failure' }, 500);
+  } catch (err) {
+    return c.json({ error: 'Stream fail' }, 500);
   }
 });
 

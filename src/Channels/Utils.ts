@@ -13,10 +13,16 @@ export async function checkStreamStatus(url: string | null): Promise<string> {
   if (!url) return 'offline';
   const cached = statusCache.get(url);
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
+  
+  const headers = { 
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Accept': '*/*'
+  };
+
   try {
     const res = await axios.head(url, { 
-      timeout: 2000,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 5000,
+      headers,
       validateStatus: (status) => status >= 200 && status < 500
     });
     let status = 'offline';
@@ -25,7 +31,7 @@ export async function checkStreamStatus(url: string | null): Promise<string> {
     else {
       try {
         await axios.get(url, { 
-          timeout: 2000, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+          timeout: 5000, headers: { ...headers, 'Range': 'bytes=0-0' },
           validateStatus: (status) => status >= 200 && status < 400
         });
         status = 'online';
@@ -40,7 +46,7 @@ export async function checkStreamStatus(url: string | null): Promise<string> {
     }
     try {
       await axios.get(url, { 
-        timeout: 2000, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+        timeout: 5000, headers: { ...headers, 'Range': 'bytes=0-0' },
         validateStatus: (status) => status >= 200 && status < 400
       });
       statusCache.set(url, { status: 'online', time: Date.now() });

@@ -37,9 +37,9 @@ const app = new Hono();
 // 1. Global Middleware
 app.use('*', logger());
 app.use('*', cors({
-  origin: (origin) => origin,
+  origin: (origin) => origin || '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   exposeHeaders: ['Content-Length'],
   maxAge: 600,
   credentials: true,
@@ -105,10 +105,10 @@ app.route('/api/channels/stream', stream);
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/logo', logo);
 app.route('/api/channels/meta', metadata); // New base for categories, languages, etc.
+app.route('/api/channels', iptv);
 app.route('/api/channels', channels);
 
 app.route('/api/channels/comments', comments);
-app.route('/api/channels', iptv);
 app.route('/api/social/profile', profile);
 app.route('/api/social/follow', follow);
 app.route('/api/admin/dashboard', adminDashboard);
