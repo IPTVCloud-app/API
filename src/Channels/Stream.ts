@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import axios from 'axios';
 import { HTTPException } from 'hono/http-exception';
 import { stream } from 'hono/streaming';
+// @ts-ignore
+import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
@@ -46,11 +48,11 @@ export async function getStreamIndex() {
 }
 
 /* -------------------------------------------------------
-   CONTINUOUS RELAY ENGINE (BLAZINGLY FAST)
+   CONTINUOUS RELAY ENGINE (fMP4 TRANSMUXING)
 ------------------------------------------------------- */
 
 /**
- * Highly optimized HLS to TS Relay
+ * Highly optimized HLS to fMP4 Relay
  * Designed for Vercel: Stateless, aggressive, and stable.
  */
 async function relayStream(c: any, sourceUrl: string, ua: string) {
@@ -60,7 +62,27 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
     const segmentBuffer: { url: string; promise: Promise<any> }[] = [];
     let isActive = true;
 
-    streamInstance.onAbort(() => { isActive = false; });
+    // ⚡ fMP4 Transmuxer Setup
+    const transmuxer = new muxjs.mp4.Transmuxer({
+      keepOriginalTimestamps: true,
+    });
+
+    // Handle transmuxed data
+    transmuxer.on('data', (event: any) => {
+      // event.initSegment: ftyp and moov
+      // event.data: mdat and moof
+      if (event.initSegment) {
+        streamInstance.write(event.initSegment).catch(() => { isActive = false; });
+      }
+      if (event.data) {
+        streamInstance.write(event.data).catch(() => { isActive = false; });
+      }
+    });
+
+    streamInstance.onAbort(() => {
+      isActive = false;
+      transmuxer.dispose();
+    });
 
     // ⚡ Fast Manifest Monitor
     const monitor = async () => {
@@ -68,7 +90,7 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
         try {
           const { data: manifest } = await axios.get(sourceUrl, {
             headers: { 'User-Agent': ua, 'Referer': new URL(sourceUrl).origin },
-            timeout: 4000,
+            timeout: 5000,
             responseType: 'text'
           });
 
@@ -84,17 +106,16 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
                 // ⚡ Pre-fetch segment immediately
                 const promise = axios.get(absUrl, {
                   headers: { 'User-Agent': ua, 'Referer': new URL(sourceUrl).origin },
-                  timeout: 12000,
+                  timeout: 20000,
                   responseType: 'stream'
                 }).then(res => res.data).catch(() => null);
 
                 segmentBuffer.push({ url: absUrl, promise });
-                if (segmentBuffer.length > 20) segmentBuffer.shift();
+                if (segmentBuffer.length > 25) segmentBuffer.shift();
               }
             }
           }
           
-          // Cleanup
           if (seenSegments.size > 200) {
             const arr = Array.from(seenSegments);
             arr.slice(0, 100).forEach(s => seenSegments.delete(s));
@@ -106,6 +127,9 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
 
     monitor();
 
+    // ⚡ Initial Delay to build buffer for "Blazingly Fast" start
+    await new Promise(r => setTimeout(r, 1500));
+
     // ⚡ Sequential Relay Loop
     while (isActive) {
       if (segmentBuffer.length > 0) {
@@ -113,23 +137,25 @@ async function relayStream(c: any, sourceUrl: string, ua: string) {
         if (!item) continue;
         const segmentStream = await item.promise;
         
-        if (segmentStream) {
+        if (segmentStream && isActive) {
           try {
             for await (const chunk of segmentStream) {
-              if (!isActive) {
-                if (segmentStream.destroy) segmentStream.destroy();
-                break;
-              }
-              await streamInstance.write(chunk);
+              if (!isActive) break;
+              // Push TS chunk into transmuxer
+              transmuxer.push(new Uint8Array(chunk));
+              transmuxer.flush();
             }
+            if (segmentStream.destroy) segmentStream.destroy();
           } catch (e: any) {
             if (segmentStream.destroy) segmentStream.destroy();
           }
         }
       } else {
-        await new Promise(r => setTimeout(r, 150));
+        await new Promise(r => setTimeout(r, 100));
       }
     }
+    
+    transmuxer.dispose();
   });
 }
 
@@ -160,12 +186,13 @@ router.get('/', async (c) => {
     if (found) selected = found;
   }
 
-  // Set Relay Headers
-  c.header('Content-Type', 'video/mp2t');
+  // Set Relay Headers optimized for fMP4 video support and speed
+  c.header('Content-Type', 'video/mp4');
+  c.header('Content-Disposition', 'inline');
   c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('Connection', 'keep-alive');
-  c.header('X-Stream-Engine', 'IPTVCloud-V6');
+  c.header('X-Stream-Engine', 'IPTVCloud-fMP4-V8');
 
   return relayStream(c, selected.url, selected.user_agent || 'Mozilla/5.0');
 });
