@@ -216,10 +216,14 @@ async function getShared(channelKey: string, initialUrl: string, ua: string): Pr
   return shared;
 }
 
+/**
+ * High-Performance Native MP4 Proxy
+ */
 router.get('/stream', async (c) => {
   const id = c.req.query('id');
   const res = c.req.query('res') || 'auto';
   if (!id) return c.json({ error: 'ID required' }, 400);
+
   try {
     const origId = await getOriginalId(id);
     const streams = await getStreamIndex();
@@ -228,39 +232,72 @@ router.get('/stream', async (c) => {
     if (allowed.length === 0) return c.json({ error: 'No supported streams' }, 404);
     
     let idx = 0;
-    if (res !== 'auto') { const f = allowed.findIndex((s: any) => s.quality === res); if (f !== -1) idx = f; }
+    if (res !== 'auto') { 
+      const f = allowed.findIndex((s: any) => s.quality === res); 
+      if (f !== -1) idx = f; 
+    }
     let sel = allowed[idx];
-    const status = await checkStreamStatus(sel.url);
-    if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
-    if (status === 'offline') return c.json({ error: 'Offline.' }, 404);
-
     const ua = sel.user_agent || 'Mozilla/5.0';
+
+    // Status check with very short timeout to avoid blocking the initial response
+    const status = await axios.head(sel.url, { 
+      timeout: 1500, 
+      headers: { 'User-Agent': ua },
+      validateStatus: (s) => s >= 200 && s < 500 
+    }).then(r => r.status === 403 ? 'geo-blocked' : (r.status < 400 ? 'online' : 'offline'))
+      .catch(() => 'online'); // Fail open for the actual stream to handle it
+
+    if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
+    
+    // Set headers immediately
     c.header('Content-Type', 'video/mp4');
     c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
     c.header('Connection', 'keep-alive');
+    c.header('X-Content-Type-Options', 'nosniff');
 
     return stream(c, async (stream) => {
+      // 1. INSTANT HANDSHAKE: Send tiny MP4 atom to satisfy browser/gateway
+      stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101])); 
+      
       const key = `${id}_${sel.quality}`;
       const shared = await getShared(key, sel.url, ua);
       shared.viewers++;
+
       const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
       let initSent = false;
-      transmuxer.on('data', (e: any) => { if (e.data) stream.write(Buffer.from(e.data)); });
-      if (shared.initSegment) { stream.write(shared.initSegment); initSent = true; }
+      let closed = false;
+
+      // Interaction handlers
+      transmuxer.on('data', (e: any) => { if (e.data && !closed) stream.write(Buffer.from(e.data)); });
       
+      // Fast-track init segment
+      if (shared.initSegment) {
+        stream.write(shared.initSegment);
+        initSent = true;
+      }
+
       const sent = new Set<string>();
       let offset = 0;
-      let closed = false;
+
+      // Warm buffer delivery
       const warm = shared.segments.slice(-5);
       for (const s of warm) {
-        if (!initSent && !shared.initSegment) transmuxer.on('data', (e: any) => { if (e.initSegment) { stream.write(Buffer.from(e.initSegment)); initSent = true; } });
+        if (closed) break;
+        if (!initSent && !shared.initSegment) {
+          transmuxer.on('data', (e: any) => {
+            if (e.initSegment && !initSent) { stream.write(Buffer.from(e.initSegment)); initSent = true; }
+          });
+        }
         transmuxer.setBaseMediaDecodeTime(offset * 90000);
         offset += s.duration;
         transmuxer.push(new Uint8Array(s.data));
         transmuxer.flush();
         sent.add(s.url);
       }
+
       c.req.raw.signal?.addEventListener('abort', () => { closed = true; });
+
+      // Active Streaming Loop
       try {
         while (!closed) {
           const fresh = shared.segments.filter(s => !sent.has(s.url));
@@ -273,9 +310,17 @@ router.get('/stream', async (c) => {
               transmuxer.flush();
               sent.add(s.url);
             }
-          } else await new Promise(r => setTimeout(r, 1000));
+          } else {
+            // Keep-alive heartbeat while waiting for source
+            if (!closed) stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
+            await new Promise(r => setTimeout(r, 1000));
+          }
         }
-      } finally { shared.viewers--; closed = true; }
+      } catch (err) {
+      } finally {
+        shared.viewers--;
+        closed = true;
+      }
     });
   } catch (error) { return c.json({ error: 'Stream error' }, 500); }
 });
