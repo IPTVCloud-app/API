@@ -33,28 +33,31 @@ let metadataMaps: {
   subdivisions: any[];
 } | null = null;
 let lastIndexLoad = 0;
-const INDEX_TTL = 1000 * 60 * 60; // 1 hour
+const INDEX_TTL = 1000 * 60 * 30; // 30 minutes cache for serverless stability
 
 // Status Cache
 const statusCache = new Map<string, { status: string, time: number }>();
 const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
 
 /**
- * Build Metadata Lookups
+ * Build Metadata Lookups (Optimized with caching and concurrent fetching)
  */
 async function getMetadataMaps() {
   const now = Date.now();
   if (metadataMaps && (now - lastIndexLoad) < INDEX_TTL) return metadataMaps;
+  
   try {
+    console.log('[Metadata] Refreshing indexes...');
     const [cnt, lng, reg, tz, cat, city, sub] = await Promise.all([
-      axios.get(COUNTRIES_URL).then(r => r.data),
-      axios.get(LANGUAGES_URL).then(r => r.data),
-      axios.get(REGIONS_URL).then(r => r.data),
-      axios.get(TIMEZONES_URL).then(r => r.data),
-      axios.get(CATEGORIES_URL).then(r => r.data),
-      axios.get(CITIES_URL).then(r => r.data),
-      axios.get(SUBDIVISIONS_URL).then(r => r.data)
+      axios.get(COUNTRIES_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(LANGUAGES_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(REGIONS_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(TIMEZONES_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(CATEGORIES_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(CITIES_URL, { timeout: 10000 }).then(r => r.data),
+      axios.get(SUBDIVISIONS_URL, { timeout: 10000 }).then(r => r.data)
     ]);
+
     const countryToTz = new Map<string, string[]>();
     tz.forEach((t: any) => {
       t.countries?.forEach((code: string) => {
@@ -63,6 +66,7 @@ async function getMetadataMaps() {
         countryToTz.set(code, list);
       });
     });
+
     metadataMaps = {
       countries: new Map(cnt.map((c: any) => [c.code, c])),
       languages: new Map(lng.map((l: any) => [l.code, l.name])),
@@ -72,9 +76,12 @@ async function getMetadataMaps() {
       cities: city,
       subdivisions: sub
     };
+    
+    lastIndexLoad = now;
     return metadataMaps;
   } catch (err) {
     console.error('[Metadata] Failed to load metadata:', err);
+    // Return stale cache if available, else empty structure
     return metadataMaps || { countries: new Map(), languages: new Map(), regions: new Map(), timezones: new Map(), categories: [], cities: [], subdivisions: [] };
   }
 }
@@ -213,57 +220,67 @@ async function runPuller(channelKey: string) {
   if (shared.isUpdating) return;
   shared.isUpdating = true;
   try {
-    const { data: playlist } = await axios.get(shared.mediaPlaylistUrl, { headers: { 'User-Agent': shared.userAgent }, timeout: 3000 });
+    const { data: playlist } = await axios.get(shared.mediaPlaylistUrl, { headers: { 'User-Agent': shared.userAgent }, timeout: 4000 });
     const lines = playlist.split('\n');
     const baseUrl = shared.mediaPlaylistUrl.substring(0, shared.mediaPlaylistUrl.lastIndexOf('/') + 1);
-    let curDur = 10;
+    let curDur = 6;
     const pending: { url: string, duration: number }[] = [];
     for (const line of lines) {
-      if (line.startsWith('#EXTINF:')) curDur = parseFloat(line.split(':')[1]) || 10;
+      if (line.startsWith('#EXTINF:')) curDur = parseFloat(line.split(':')[1]) || 6;
       else if (line.trim() && !line.startsWith('#') && !line.toLowerCase().includes('.m3u8')) {
         const url = line.trim().startsWith('http') ? line.trim() : new URL(line.trim(), baseUrl).href;
         if (!shared.segments.find(s => s.url === url)) pending.push({ url, duration: curDur });
       }
     }
+    
+    // Process new segments
     const newSegs = await Promise.all(pending.map(async (seg) => {
       try {
-        const res = await axios.get(seg.url, { responseType: 'arraybuffer', headers: { 'User-Agent': shared.userAgent }, timeout: 5000 });
+        const res = await axios.get(seg.url, { responseType: 'arraybuffer', headers: { 'User-Agent': shared.userAgent }, timeout: 8000 });
         return { url: seg.url, data: Buffer.from(res.data), duration: seg.duration };
       } catch (e) { return null; }
     }));
 
-    if (!shared.initSegment && newSegs.length > 0 && newSegs[0]) {
+    const validSegs = newSegs.filter((s): s is CachedSegment => s !== null);
+    
+    // Robust initSegment capture
+    if (!shared.initSegment && validSegs.length > 0) {
        const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
-       transmuxer.on('data', (event: any) => { if (event.initSegment) shared.initSegment = Buffer.from(event.initSegment); });
-       transmuxer.push(new Uint8Array(newSegs[0].data));
+       transmuxer.on('data', (event: any) => { 
+         if (event.initSegment) shared.initSegment = Buffer.from(event.initSegment); 
+       });
+       // Push first 3 segments to ensure enough info for initSegment
+       validSegs.slice(0, 3).forEach(s => transmuxer.push(new Uint8Array(s.data)));
        transmuxer.flush();
     }
-    for (const s of newSegs) {
-      if (s) {
-        shared.segments.push(s);
-        shared.totalTimeOffset += s.duration;
-        if (shared.segments.length > MAX_SEGMENTS_CACHE) shared.segments.shift();
-      }
+
+    for (const s of validSegs) {
+      shared.segments.push(s);
+      shared.totalTimeOffset += s.duration;
+      if (shared.segments.length > MAX_SEGMENTS_CACHE) shared.segments.shift();
     }
     shared.lastUpdate = Date.now();
   } catch (e) {} finally { shared.isUpdating = false; }
 }
 
 async function getShared(channelKey: string, initialUrl: string, ua: string): Promise<SharedStream> {
-  let shared = globalStreamRegistry.get(channelKey);
+  const key = channelKey.toLowerCase();
+  let shared = globalStreamRegistry.get(key);
   if (!shared) {
     let mediaUrl = initialUrl;
     try {
-       const { data: content } = await axios.get(initialUrl, { headers: { 'User-Agent': ua }, timeout: 2500 });
+       const { data: content } = await axios.get(initialUrl, { headers: { 'User-Agent': ua }, timeout: 3000 });
        if (!content.includes('#EXT-X-TARGETDURATION')) {
          const first = content.split('\n').find((l: string) => l.trim() && !l.startsWith('#') && l.toLowerCase().includes('.m3u8'));
-         if (first) mediaUrl = first.trim().startsWith('http') ? first.trim() : new URL(first.trim(), initialUrl.substring(0, initialUrl.lastIndexOf('/') + 1)).href;
+         if (first) {
+           mediaUrl = first.trim().startsWith('http') ? first.trim() : new URL(first.trim(), initialUrl.substring(0, initialUrl.lastIndexOf('/') + 1)).href;
+         }
        }
     } catch (e) {}
     shared = { mediaPlaylistUrl: mediaUrl, userAgent: ua, segments: [], initSegment: null, totalTimeOffset: 0, lastUpdate: 0, viewers: 0, isUpdating: false };
-    globalStreamRegistry.set(channelKey, shared);
-    await runPuller(channelKey);
-    shared.timer = setInterval(() => runPuller(channelKey), 4000);
+    globalStreamRegistry.set(key, shared);
+    await runPuller(key);
+    shared.timer = setInterval(() => runPuller(key), 3000);
   }
   return shared;
 }
@@ -286,7 +303,7 @@ router.get('/stream', async (c) => {
 
     if (chStreams.length === 0) return c.json({ error: 'No streams found for this channel' }, 404);
     
-    // Permissive Filter: Fallback to all streams if no low-res ones pass
+    // Permissive Filter: Falls back to all streams if no low-res ones pass
     let allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
     if (allowed.length === 0) allowed = chStreams; 
 
@@ -307,12 +324,12 @@ router.get('/stream', async (c) => {
 
     if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
     
-    const channelKey = `${searchId}_${sel.quality}`; // Normalized key
+    const channelKey = `${searchId}_${sel.quality}`.toLowerCase();
     const shared = await getShared(channelKey, sel.url, ua);
 
-    // CRITICAL: Wait for initSegment
+    // CRITICAL: Wait for initSegment (MP4 Header)
     let waitCount = 0;
-    while (!shared.initSegment && waitCount < 20) {
+    while (!shared.initSegment && waitCount < 30) {
       await new Promise(r => setTimeout(r, 500));
       waitCount++;
     }
@@ -324,8 +341,10 @@ router.get('/stream', async (c) => {
     c.header('Connection', 'keep-alive');
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('Access-Control-Allow-Origin', '*');
+    c.header('X-Accel-Buffering', 'no'); // Vercel optimization: Disable proxy buffering
 
     return stream(c, async (stream) => {
+      // 1. Send the MP4 Header immediately
       await stream.write(shared.initSegment!);
 
       const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
@@ -334,16 +353,15 @@ router.get('/stream', async (c) => {
 
       transmuxer.on('data', async (e: any) => { 
         if (e.data && !closed) {
-          try {
-            await stream.write(Buffer.from(e.data));
-          } catch (err) { closed = true; }
+          try { await stream.write(Buffer.from(e.data)); } catch (err) { closed = true; }
         } 
       });
 
       const sent = new Set<string>();
       let offset = 0;
 
-      const warm = shared.segments.slice(-5);
+      // 2. Warm Buffer (DVR Start)
+      const warm = shared.segments.slice(-10);
       for (const s of warm) {
         if (closed) break;
         transmuxer.setBaseMediaDecodeTime(offset * 90000);
@@ -353,9 +371,15 @@ router.get('/stream', async (c) => {
         sent.add(s.url);
       }
 
+      // 3. Live Loop with Watchdog
       try {
         shared.viewers++;
         while (!closed) {
+          // Watchdog: If background puller is slow or throttled, trigger update manually
+          if (Date.now() - shared.lastUpdate > 5000) {
+            await runPuller(channelKey);
+          }
+
           const fresh = shared.segments.filter(s => !sent.has(s.url));
           if (fresh.length > 0) {
             for (const s of fresh) {
@@ -367,6 +391,7 @@ router.get('/stream', async (c) => {
               sent.add(s.url);
             }
           } else {
+            // Heartbeat: Send an 8-byte MP4 'free' atom to keep the connection alive
             if (!closed) await stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
             await new Promise(r => setTimeout(r, 1000));
           }
@@ -376,7 +401,7 @@ router.get('/stream', async (c) => {
         closed = true;
       }
     });
-  } catch (error) { return c.json({ error: 'Stream error' }, 500); }
+  } catch (error) { return c.json({ error: 'Stream failure' }, 500); }
 });
 
 export async function getShortId(originalId: string): Promise<string> {
