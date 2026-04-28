@@ -218,59 +218,60 @@ async function getShared(channelKey: string, initialUrl: string, ua: string): Pr
 
 /**
  * High-Performance Native MP4 Proxy
+ * Zero-Latency Handshake Architecture
  */
 router.get('/stream', async (c) => {
   const id = c.req.query('id');
   const res = c.req.query('res') || 'auto';
   if (!id) return c.json({ error: 'ID required' }, 400);
 
-  try {
-    const origId = await getOriginalId(id);
-    const streams = await getStreamIndex();
-    const chStreams = streams.get(origId || id) || [];
-    const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-    if (allowed.length === 0) return c.json({ error: 'No supported streams' }, 404);
+  // Set headers IMMEDIATELY - No await before this!
+  c.header('Content-Type', 'video/mp4');
+  c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+  c.header('Connection', 'keep-alive');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Access-Control-Allow-Origin', '*');
+
+  return stream(c, async (stream) => {
+    // 1. Instant satisfy browser (Empty MP4 Atom)
+    stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101])); 
     
-    let idx = 0;
-    if (res !== 'auto') { 
-      const f = allowed.findIndex((s: any) => s.quality === res); 
-      if (f !== -1) idx = f; 
-    }
-    let sel = allowed[idx];
-    const ua = sel.user_agent || 'Mozilla/5.0';
+    let isClosed = false;
+    c.req.raw.signal?.addEventListener('abort', () => { isClosed = true; });
 
-    // Status check with very short timeout to avoid blocking the initial response
-    const status = await axios.head(sel.url, { 
-      timeout: 1500, 
-      headers: { 'User-Agent': ua },
-      validateStatus: (s) => s >= 200 && s < 500 
-    }).then(r => r.status === 403 ? 'geo-blocked' : (r.status < 400 ? 'online' : 'offline'))
-      .catch(() => 'online'); // Fail open for the actual stream to handle it
-
-    if (status === 'geo-blocked') return c.json({ code: 403, message: 'Geo-blocked.' }, 403);
-    
-    // Set headers immediately
-    c.header('Content-Type', 'video/mp4');
-    c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
-    c.header('Connection', 'keep-alive');
-    c.header('X-Content-Type-Options', 'nosniff');
-
-    return stream(c, async (stream) => {
-      // 1. INSTANT HANDSHAKE: Send tiny MP4 atom to satisfy browser/gateway
-      stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101])); 
+    try {
+      // 2. Resolve stream identity in background
+      const origId = await getOriginalId(id);
+      const streams = await getStreamIndex();
+      const chStreams = streams.get(origId || id) || [];
+      const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
       
+      if (allowed.length === 0 || isClosed) {
+        if (!isClosed) stream.close();
+        return;
+      }
+      
+      let idx = 0;
+      if (res !== 'auto') { 
+        const f = allowed.findIndex((s: any) => s.quality === res); 
+        if (f !== -1) idx = f; 
+      }
+      const sel = allowed[idx];
+      const ua = sel.user_agent || 'Mozilla/5.0';
       const key = `${id}_${sel.quality}`;
+
+      // 3. Join Shared Pool (Non-blocking check)
       const shared = await getShared(key, sel.url, ua);
+      if (isClosed) { shared.viewers--; return; }
       shared.viewers++;
 
       const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
       let initSent = false;
-      let closed = false;
-
-      // Interaction handlers
-      transmuxer.on('data', (e: any) => { if (e.data && !closed) stream.write(Buffer.from(e.data)); });
       
-      // Fast-track init segment
+      transmuxer.on('data', (e: any) => { 
+        if (e.data && !isClosed) stream.write(Buffer.from(e.data)); 
+      });
+
       if (shared.initSegment) {
         stream.write(shared.initSegment);
         initSent = true;
@@ -279,50 +280,41 @@ router.get('/stream', async (c) => {
       const sent = new Set<string>();
       let offset = 0;
 
-      // Warm buffer delivery
-      const warm = shared.segments.slice(-5);
-      for (const s of warm) {
-        if (closed) break;
-        if (!initSent && !shared.initSegment) {
-          transmuxer.on('data', (e: any) => {
-            if (e.initSegment && !initSent) { stream.write(Buffer.from(e.initSegment)); initSent = true; }
-          });
-        }
-        transmuxer.setBaseMediaDecodeTime(offset * 90000);
-        offset += s.duration;
-        transmuxer.push(new Uint8Array(s.data));
-        transmuxer.flush();
-        sent.add(s.url);
-      }
-
-      c.req.raw.signal?.addEventListener('abort', () => { closed = true; });
-
-      // Active Streaming Loop
-      try {
-        while (!closed) {
-          const fresh = shared.segments.filter(s => !sent.has(s.url));
-          if (fresh.length > 0) {
-            for (const s of fresh) {
-              if (closed) break;
-              transmuxer.setBaseMediaDecodeTime(offset * 90000);
-              offset += s.duration;
-              transmuxer.push(new Uint8Array(s.data));
-              transmuxer.flush();
-              sent.add(s.url);
+      // 4. Main Delivery Loop
+      while (!isClosed) {
+        const fresh = shared.segments.filter(s => !sent.has(s.url));
+        
+        if (fresh.length > 0) {
+          for (const s of fresh) {
+            if (isClosed) break;
+            if (!initSent && !shared.initSegment) {
+              transmuxer.on('data', (e: any) => {
+                if (e.initSegment && !initSent) { 
+                  stream.write(Buffer.from(e.initSegment)); 
+                  initSent = true; 
+                }
+              });
             }
-          } else {
-            // Keep-alive heartbeat while waiting for source
-            if (!closed) stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
-            await new Promise(r => setTimeout(r, 1000));
+            transmuxer.setBaseMediaDecodeTime(offset * 90000);
+            offset += s.duration;
+            transmuxer.push(new Uint8Array(s.data));
+            transmuxer.flush();
+            sent.add(s.url);
           }
+        } else {
+          // Keep-alive heartbeat while waiting for new source data
+          if (!isClosed) stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101]));
+          await new Promise(r => setTimeout(r, 1000));
         }
-      } catch (err) {
-      } finally {
-        shared.viewers--;
-        closed = true;
       }
-    });
-  } catch (error) { return c.json({ error: 'Stream error' }, 500); }
+      
+      shared.viewers--;
+    } catch (err) {
+      console.error('[Stream] Fatal error:', err);
+    } finally {
+      isClosed = true;
+    }
+  });
 });
 
 export async function getShortId(originalId: string): Promise<string> {
@@ -351,19 +343,24 @@ router.get('/', async (c) => {
   const baseUrl = `${protocol}://${c.req.header('host')}`;
   try {
     const channels = await fetchChannelsSegmented(offset, statusFilter ? limit * 2 : limit, baseUrl, search, {});
+    const streams = await getStreamIndex();
     const results = await Promise.all(channels.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
-      const status = await checkStreamStatus(ch.primary_stream_url);
-      const streams = await getStreamIndex();
+      
       const chStreams = streams.get(ch.id) || [];
       const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-      return { 
+      const primaryUrl = allowed.length > 0 ? allowed[0].url : null;
+      const status = await checkStreamStatus(primaryUrl);
+      
+      const item = { 
         ...ch, id: shortId, original_id: ch.id, 
         stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
         thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
         logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
         status, available_resolutions: allowed.map((s: any) => s.quality), abr_supported: allowed.length > 1
       };
+      delete (item as any).primary_stream_url;
+      return item;
     }));
     let final = results;
     if (statusFilter === 'online' || statusFilter === 'offline') final = results.filter(res => res.status === statusFilter);
@@ -423,8 +420,7 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
                 results.push({
                   ...ch, country_name: countryInfo?.name || null, region: countryInfo?.region || null,
                   languages_names: langNames, geo_blocked: isGeoBlocked,
-                  highest_allowed_quality: allowed.length > 0 ? allowed[0].quality : null,
-                  primary_stream_url: allowed.length > 0 ? allowed[0].url : null
+                  highest_allowed_quality: allowed.length > 0 ? allowed[0].quality : null
                 });
                 if (results.length >= limit) { streamData.destroy(); resolve(results); return; }
               }
