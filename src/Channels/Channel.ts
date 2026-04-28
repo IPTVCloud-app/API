@@ -21,9 +21,14 @@ let metadataMaps: any = null;
 let lastIndexLoad = 0;
 const INDEX_TTL = 1000 * 60 * 60; // 1 hour
 
-// Status cache (URL -> { status: string, time: number })
+// Status & Chunk Cache (Blazing Fast Layer)
 const statusCache = new Map<string, { status: string, time: number }>();
+const chunkCache = new Map<string, { data: Uint8Array, contentType: string, time: number }>();
+const playlistCache = new Map<string, { data: string, time: number }>();
+
 const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
+const CHUNK_TTL = 1000 * 30; // 30 seconds for video chunks
+const PLAYLIST_TTL = 1000 * 5; // 5 seconds for sub-playlists (very short for live)
 
 /**
  * Build Metadata Lookups
@@ -72,7 +77,7 @@ async function checkStreamStatus(url: string): Promise<string> {
 
   try {
     const res = await axios.head(url, { 
-      timeout: 1500, 
+      timeout: 1200, 
       headers: { 'User-Agent': 'Mozilla/5.0' },
       validateStatus: (status) => status >= 200 && status < 400
     });
@@ -80,18 +85,8 @@ async function checkStreamStatus(url: string): Promise<string> {
     statusCache.set(url, { status, time: Date.now() });
     return status;
   } catch (err) {
-    try {
-      await axios.get(url, { 
-        timeout: 1500, 
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
-        validateStatus: (status) => status >= 200 && status < 400
-      });
-      statusCache.set(url, { status: 'online', time: Date.now() });
-      return 'online';
-    } catch (e) {
-      statusCache.set(url, { status: 'offline', time: Date.now() });
-      return 'offline';
-    }
+    statusCache.set(url, { status: 'offline', time: Date.now() });
+    return 'offline';
   }
 }
 
@@ -222,7 +217,6 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
                 matchesFound++;
               } else {
                 const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-                
                 const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
                 const tzList = meta.timezones.get(ch.country) || [];
 
@@ -255,26 +249,53 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 }
 
 /**
- * HLS Chunk Proxy
- * Ensures chunks are fetched with the correct headers (User-Agent, etc.)
+ * Optimized HLS Chunk Proxy (The "Blazing Fast" Secret)
  */
 router.get('/stream/chunk', async (c) => {
   const url = c.req.query('u');
   const ua = c.req.query('ua') || 'Mozilla/5.0';
-
   if (!url) return c.json({ error: 'URL required' }, 400);
 
+  const decodedUrl = decodeURIComponent(url);
+  
+  // 1. Instant Cache Check
+  const cached = chunkCache.get(decodedUrl);
+  if (cached && (Date.now() - cached.time) < CHUNK_TTL) {
+    return c.body(cached.data as any, 200, {
+      'Content-Type': cached.contentType,
+      'Cache-Control': 'public, max-age=60, stale-while-revalidate=30',
+      'Access-Control-Allow-Origin': '*'
+    });
+  }
+
   try {
+    // 2. Optimized Fetch with Keep-Alive
     const response = await axios({
       method: 'get',
-      url: decodeURIComponent(url),
-      responseType: 'stream',
-      headers: { 'User-Agent': decodeURIComponent(ua) }
+      url: decodedUrl,
+      responseType: 'arraybuffer',
+      headers: { 
+        'User-Agent': decodeURIComponent(ua),
+        'Connection': 'keep-alive'
+      },
+      timeout: 5000 
     });
 
-    return c.body(response.data, 200, {
-      'Content-Type': response.headers['content-type'] || 'video/MP2T',
-      'Cache-Control': 'public, max-age=10',
+    const data = new Uint8Array(response.data);
+    const contentType = String(response.headers['content-type'] || 'video/MP2T');
+    
+    // 3. Selective In-Memory Caching (Skip massive files to protect Vercel RAM)
+    if (data.length < 3 * 1024 * 1024) { 
+       chunkCache.set(decodedUrl, { data, contentType, time: Date.now() });
+       if (chunkCache.size > 200) {
+         const firstKey = chunkCache.keys().next().value;
+         if (firstKey) chunkCache.delete(firstKey);
+       }
+    }
+
+    return c.body(data, 200, {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=60, stale-while-revalidate=30',
       'Access-Control-Allow-Origin': '*'
     });
   } catch (err) {
@@ -283,7 +304,7 @@ router.get('/stream/chunk', async (c) => {
 });
 
 /**
- * ABR Stream Controller (Full Proxy)
+ * ABR Stream Controller (High-Performance Proxy)
  */
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
@@ -301,44 +322,53 @@ router.get('/stream', async (c) => {
     const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
 
     if (allowedStreams.length === 0) return c.json({ error: 'No supported streams found' }, 404);
-
     const highestAvailable = allowedStreams[0];
 
-    // 1. Specific Resolution Proxy (with chunk rewriting)
+    // 1. Specific Resolution Playlist with Pre-fetch and Short Cache
     if (resolution) {
       if (getQualityWeight(resolution) > getQualityWeight(highestAvailable.quality)) {
         return c.json({ code: 403, message: `Quality limit exceeded.` }, 403);
       }
-      const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
-      const streamUrl = selected.url;
-      const userAgent = selected.user_agent || 'Mozilla/5.0';
       
-      const response = await axios.get(streamUrl, {
-        responseType: 'text',
-        headers: { 'User-Agent': userAgent }
+      const cacheKey = `${shortId}_${resolution}`;
+      const cachedPlaylist = playlistCache.get(cacheKey);
+      if (cachedPlaylist && (Date.now() - cachedPlaylist.time) < PLAYLIST_TTL) {
+        return c.body(cachedPlaylist.data, 200, { 
+          'Content-Type': 'application/x-mpegURL', 
+          'Access-Control-Allow-Origin': '*' 
+        });
+      }
+
+      const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
+      const response = await axios.get(selected.url, { 
+        timeout: 3000, 
+        responseType: 'text', 
+        headers: { 'User-Agent': selected.user_agent || 'Mozilla/5.0' } 
       });
 
-      let content = response.data;
-      const streamBase = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
+      const streamBase = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
+      const userAgentEncoded = encodeURIComponent(selected.user_agent || 'Mozilla/5.0');
       
-      // Rewrite chunks to use our internal proxy
-      const rewrittenLines = content.split('\n').map((line: string) => {
+      const rewrittenLines = response.data.split('\n').map((line: string) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith('#')) {
           const absoluteUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, streamBase).href;
-          return `${baseUrl}/api/channels/stream/chunk?u=${encodeURIComponent(absoluteUrl)}&ua=${encodeURIComponent(userAgent)}`;
+          return `${baseUrl}/api/channels/stream/chunk?u=${encodeURIComponent(absoluteUrl)}&ua=${userAgentEncoded}`;
         }
         return line;
       });
 
-      return c.body(rewrittenLines.join('\n'), 200, { 
+      const finalPlaylist = rewrittenLines.join('\n');
+      playlistCache.set(cacheKey, { data: finalPlaylist, time: Date.now() });
+
+      return c.body(finalPlaylist, 200, { 
         'Content-Type': 'application/x-mpegURL', 
-        'Cache-Control': 'no-cache', 
+        'Cache-Control': 'no-cache, no-store, must-revalidate', 
         'Access-Control-Allow-Origin': '*' 
       });
     }
 
-    // 2. Master M3U8 for ABR
+    // 2. Master M3U8 (ABR) with Extended Cache
     let masterM3U8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
     allowedStreams.forEach((s: any) => {
       let bandwidth = 800000;
@@ -353,7 +383,7 @@ router.get('/stream', async (c) => {
 
     return c.body(masterM3U8, 200, { 
       'Content-Type': 'application/x-mpegURL', 
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'public, max-age=300', 
       'Access-Control-Allow-Origin': '*'
     });
   } catch (error) { return c.json({ error: 'Stream controller error' }, 500); }
@@ -405,13 +435,7 @@ router.get('/', async (c) => {
     const resultsWithStatus = await Promise.all(enrichedSlice.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
       const status = await checkStreamStatus(ch.primary_stream_url);
-      const item = { 
-        ...ch, 
-        id: shortId, 
-        original_id: ch.id, 
-        stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
-        status: status 
-      };
+      const item = { ...ch, id: shortId, original_id: ch.id, stream: `${baseUrl}/api/channels/stream?id=${shortId}`, status: status };
       delete (item as any).primary_stream_url;
       return item;
     }));
