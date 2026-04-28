@@ -265,10 +265,11 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 /**
  * High-Performance Native MP4 Proxy (No FFmpeg)
  * Transmuxes TS segments into fMP4 fragments on-the-fly.
+ * Supports Server-Side ABR (Adaptive Bitrate) for 'res=auto'.
  */
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
-  const resolution = c.req.query('res');
+  let requestedRes = c.req.query('res') || 'auto';
   
   if (!shortId) return c.json({ error: 'ID required' }, 400);
 
@@ -279,7 +280,15 @@ router.get('/stream', async (c) => {
     const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
 
     if (allowedStreams.length === 0) return c.json({ error: 'No supported streams found' }, 404);
-    const selected = (resolution ? allowedStreams.find((s: any) => s.quality === resolution) : null) || allowedStreams[0];
+    
+    // Select initial stream
+    let currentIndex = 0;
+    if (requestedRes !== 'auto') {
+      const foundIdx = allowedStreams.findIndex((s: any) => s.quality === requestedRes);
+      if (foundIdx !== -1) currentIndex = foundIdx;
+    }
+    
+    let selected = allowedStreams[currentIndex];
 
     // 1. Initial Status Check
     const status = await checkStreamStatus(selected.url);
@@ -301,25 +310,57 @@ router.get('/stream', async (c) => {
 
     // 2. Return Streaming Response
     return stream(c, async (stream) => {
-      console.log(`[Stream] Starting native proxy for ${shortId}...`);
+      console.log(`[Stream] Starting native proxy for ${shortId} (${selected.quality})...`);
       
+      let mediaPlaylistUrl = selected.url;
+      let congestionCount = 0;
+      let isClosed = false;
+
+      // Recursive Resolution to find actual Media Playlist (Fast-tracked)
+      const resolveToMediaPlaylist = async (url: string): Promise<string> => {
+        try {
+          if (url.toLowerCase().includes('.ts') || url.toLowerCase().includes('.mp4')) return url;
+          const { data: content } = await axios.get(url, { headers: { 'User-Agent': userAgent }, timeout: 2500 });
+          if (content.includes('#EXT-X-TARGETDURATION')) return url;
+          const lines = content.split('\n');
+          const firstVariant = lines.find((l: string) => l.trim() && !l.startsWith('#') && l.toLowerCase().includes('.m3u8'));
+          if (firstVariant) {
+            const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
+            return firstVariant.trim().startsWith('http') ? firstVariant.trim() : new URL(firstVariant.trim(), baseUrl).href;
+          }
+        } catch (e) {}
+        return url;
+      };
+
+      mediaPlaylistUrl = await resolveToMediaPlaylist(mediaPlaylistUrl);
+
       const transmuxer = new muxjs.mp4.Transmuxer({
         keepOriginalTimestamps: true,
         baseMediaDecodeTime: 0
       });
 
       let initSegmentSent = false;
-      let isClosed = false;
-
-      // Pipe transmuxer data to Hono stream
       transmuxer.on('data', (event: any) => {
+        if (isClosed) return;
         if (!initSegmentSent && event.initSegment) {
           stream.write(Buffer.from(event.initSegment));
           initSegmentSent = true;
           console.log('[Stream] Sent initSegment');
         }
         if (event.data) {
-          stream.write(Buffer.from(event.data));
+          const ok = stream.write(Buffer.from(event.data));
+          if (!ok && requestedRes === 'auto') {
+            congestionCount++;
+            if (congestionCount > 5 && currentIndex < allowedStreams.length - 1) {
+              console.log(`[Stream] Congestion detected. Switching...`);
+              currentIndex++;
+              selected = allowedStreams[currentIndex];
+              resolveToMediaPlaylist(selected.url).then(url => { mediaPlaylistUrl = url; });
+              congestionCount = 0;
+            }
+          } else {
+            congestionCount = Math.max(0, congestionCount - 1);
+          }
         }
       });
 
@@ -328,57 +369,54 @@ router.get('/stream', async (c) => {
       const segmentQueue: QueueItem[] = [];
       const MAX_QUEUE = 3;
 
-      const fillQueue = async (m3u8Url: string) => {
+      const fillQueue = async () => {
         if (isClosed) return;
         try {
-          const { data: playlist } = await axios.get(m3u8Url, { 
-            headers: { 'User-Agent': userAgent },
-            timeout: 3000
-          });
-
-          const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+          const { data: playlist } = await axios.get(mediaPlaylistUrl, { headers: { 'User-Agent': userAgent }, timeout: 2500 });
+          const baseUrl = mediaPlaylistUrl.substring(0, mediaPlaylistUrl.lastIndexOf('/') + 1);
           const segments = playlist.split('\n')
             .filter((line: string) => line.trim() && !line.startsWith('#'))
             .map((line: string) => {
               const trimmed = line.trim();
               if (trimmed.startsWith('http')) return trimmed;
               return new URL(trimmed, baseUrl).href;
-            });
+            })
+            .filter((url: string) => !url.toLowerCase().includes('.m3u8'));
 
           for (const segUrl of segments) {
             if (sentSegments.has(segUrl) || isClosed) continue;
             if (segmentQueue.length >= MAX_QUEUE) break;
-            
             if (!segmentQueue.find(s => s.url === segUrl)) {
               const queueItem: QueueItem = { url: segUrl, data: null };
               segmentQueue.push(queueItem);
-              
-              axios.get(segUrl, { 
-                responseType: 'arraybuffer', 
-                headers: { 'User-Agent': userAgent },
-                timeout: 5000 
-              }).then(res => {
-                if (isClosed) return;
-                queueItem.data = Buffer.from(res.data);
-              }).catch(() => {
-                const idx = segmentQueue.findIndex(s => s.url === segUrl);
-                if (idx !== -1) segmentQueue.splice(idx, 1);
-              });
+              axios.get(segUrl, { responseType: 'arraybuffer', headers: { 'User-Agent': userAgent }, timeout: 5000 })
+                .then(res => {
+                  if (isClosed) return;
+                  queueItem.data = Buffer.from(res.data);
+                }).catch(() => {
+                  const idx = segmentQueue.findIndex(s => s.url === segUrl);
+                  if (idx !== -1) segmentQueue.splice(idx, 1);
+                });
             }
           }
         } catch (e) {}
       };
 
-      // Handle disconnect
       c.req.raw.signal?.addEventListener('abort', () => {
-        console.log(`[Stream] Client disconnected from ${shortId}`);
         isClosed = true;
       });
 
-      // Main Loop
-      while (!isClosed) {
-        await fillQueue(selected.url);
+      // Keep Vercel alive while waiting for source
+      const keepAliveInterval = setInterval(() => {
+        if (isClosed || initSegmentSent) {
+          clearInterval(keepAliveInterval);
+          return;
+        }
+        stream.write(Buffer.from([0, 0, 0, 8, 102, 114, 101, 101])); 
+      }, 3000);
 
+      while (!isClosed) {
+        await fillQueue();
         if (segmentQueue.length > 0 && segmentQueue[0].data) {
           const item = segmentQueue.shift()!;
           if (item.data) {
@@ -387,19 +425,17 @@ router.get('/stream', async (c) => {
             transmuxer.flush();
           }
           sentSegments.add(item.url);
-          
           if (sentSegments.size > 50) {
             const first = sentSegments.values().next().value;
             if (first) sentSegments.delete(first);
           }
         } else if (segmentQueue.length > 0 && !segmentQueue[0].data) {
-           // Wait for segment download
            await new Promise(r => setTimeout(r, 200));
         } else {
-          // Wait for new segments in playlist
           await new Promise(r => setTimeout(r, 1000));
         }
       }
+      clearInterval(keepAliveInterval);
     });
 
   } catch (error) { 
@@ -451,13 +487,31 @@ router.get('/', async (c) => {
   try {
     const scanLimit = statusFilter ? limit * 2 : limit;
     const enrichedSlice = await fetchChannelsSegmented(offset, scanLimit, baseUrl, search, filters);
+    
     const resultsWithStatus = await Promise.all(enrichedSlice.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
       const status = await checkStreamStatus(ch.primary_stream_url);
-      const item = { ...ch, id: shortId, original_id: ch.id, stream: `${baseUrl}/api/channels/stream?id=${shortId}`, status: status };
+      
+      // Get all available resolutions for ABR support info
+      const streams = await getStreamIndex();
+      const chStreams = streams.get(ch.id) || [];
+      const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+      
+      const item = { 
+        ...ch, 
+        id: shortId, 
+        original_id: ch.id, 
+        stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
+        thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
+        logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
+        status: status,
+        available_resolutions: allowedStreams.map((s: any) => s.quality),
+        abr_supported: allowedStreams.length > 1
+      };
       delete (item as any).primary_stream_url;
       return item;
     }));
+
     let finalResults = resultsWithStatus;
     if (statusFilter === 'online' || statusFilter === 'offline') {
       finalResults = resultsWithStatus.filter(res => res.status === statusFilter);

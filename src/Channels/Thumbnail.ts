@@ -48,13 +48,17 @@ if (!fs.existsSync(TEMP_DIR)) {
 }
 
 /**
- * Thumbnail Endpoint (Now using Channel Logos for maximum efficiency)
+ * Thumbnail & Logo Endpoint
+ * Differentiates between 'thumbnail' (optimized for grids) and 'logo' (high quality for branding)
  */
 router.get('/', async (c) => {
   const shortId = c.req.query('id');
   if (!shortId) return c.json({ error: 'Channel ID required' }, 400);
 
-  const thumbPath = path.join(TEMP_DIR, `${shortId}.webp`);
+  const pathName = c.req.path;
+  const isLogoMode = pathName.includes('/logo');
+  const cacheKey = isLogoMode ? `logo-${shortId}` : `thumb-${shortId}`;
+  const thumbPath = path.join(TEMP_DIR, `${cacheKey}.webp`);
 
   try {
     // 1. Check local cache
@@ -62,7 +66,7 @@ router.get('/', async (c) => {
       const stats = fs.statSync(thumbPath);
       const ageHours = (Date.now() - stats.mtimeMs) / (1000 * 60 * 60);
 
-      if (ageHours < 24) { // Logos change rarely
+      if (ageHours < 24) { 
         const fileBuffer = fs.readFileSync(thumbPath);
         return c.body(fileBuffer, 200, {
           'Content-Type': 'image/webp',
@@ -75,23 +79,37 @@ router.get('/', async (c) => {
     const originalId = await getOriginalId(shortId);
     if (!originalId) return c.json({ error: 'Channel not found' }, 404);
 
-    // 3. Find Logo URL
+    // 3. Find Logo URL from IPTV-org index
     const index = await getLogoIndex();
     const logoUrl = index.get(originalId);
     
     if (!logoUrl) {
-      // Return a nice placeholder if no logo found
       return c.redirect('https://raw.githubusercontent.com/iptv-org/iptv/master/assets/logo.png');
     }
 
-    // 4. Fetch and Optimize Logo with Sharp
+    // 4. Fetch and Process
     const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 5000 });
     const buffer = Buffer.from(response.data);
 
-    await sharp(buffer)
-      .resize(400, 400, { fit: 'inside' })
-      .webp({ quality: 80 })
-      .toFile(thumbPath);
+    const sharpInstance = sharp(buffer);
+    
+    if (isLogoMode) {
+      // 1. High Quality Logo - NO RESIZING
+      // We only convert to WebP and optimize to prevent ANY distortion
+      await sharpInstance
+        .webp({ quality: 95, lossless: true }) // Higher quality, preserving every detail
+        .toFile(thumbPath);
+    } else {
+      // 2. Optimized Thumbnail - PRESERVE ASPECT RATIO
+      // We use 'contain' with a transparent background so the logo is NEVER stretched or cropped
+      await sharpInstance
+        .resize(400, 400, { 
+          fit: 'contain', 
+          background: { r: 0, g: 0, b: 0, alpha: 0 } 
+        })
+        .webp({ quality: 80 })
+        .toFile(thumbPath);
+    }
 
     const fileBuffer = fs.readFileSync(thumbPath);
     return c.body(fileBuffer, 200, {
@@ -100,8 +118,8 @@ router.get('/', async (c) => {
     });
 
   } catch (error) {
-    console.error('Thumbnail/Logo processing error:', error);
-    return c.json({ error: 'Failed to process thumbnail' }, 500);
+    console.error('Image processing error:', error);
+    return c.json({ error: 'Failed to process image' }, 500);
   }
 });
 
