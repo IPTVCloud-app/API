@@ -33,7 +33,7 @@ router.post('/', zValidator('json', signupSchema), async (c) => {
       .from('users')
       .select('id')
       .or(`email.eq.${data.email},username.eq.${data.username}`)
-      .single();
+      .maybeSingle();
 
     if (existingUser) {
       return c.json({ error: 'Email or Username already taken' }, 400);
@@ -44,6 +44,8 @@ router.post('/', zValidator('json', signupSchema), async (c) => {
     const hashedPassword = await bcrypt.hash(data.password, salt);
 
     // 3. Create user
+    const userRole = data.email.toLowerCase() === 'reinfyteam@gmail.com' ? 'admin' : 'user';
+    
     const { error: createError } = await supabase
       .from('users')
       .insert([{ 
@@ -55,6 +57,7 @@ router.post('/', zValidator('json', signupSchema), async (c) => {
         last_name: data.lastName,
         suffix: data.suffix,
         birthday: data.birthday,
+        role: userRole,
         created_at: new Date().toISOString()
       }]);
 

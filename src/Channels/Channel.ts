@@ -103,16 +103,28 @@ router.get('/subdivisions', async (c) => {
   return c.json(meta.subdivisions);
 });
 
+router.get('/countries', async (c) => {
+  const meta = await getMetadataMaps();
+  const list = Array.from(meta.countries.values());
+  return c.json(list);
+});
+
+router.get('/regions', async (c) => {
+  const meta = await getMetadataMaps();
+  const list = Array.from(meta.regions.entries()).map(([code, name]) => ({ code, name }));
+  return c.json(list);
+});
+
 /**
  * Check if a stream is online
  */
-async function checkStreamStatus(url: string): Promise<string> {
+async function checkStreamStatus(url: string | null): Promise<string> {
   if (!url) return 'offline';
   const cached = statusCache.get(url);
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
   try {
     const res = await axios.head(url, { 
-      timeout: 2500,
+      timeout: 2000,
       headers: { 'User-Agent': 'Mozilla/5.0' },
       validateStatus: (status) => status >= 200 && status < 500
     });
@@ -122,7 +134,7 @@ async function checkStreamStatus(url: string): Promise<string> {
     else {
       try {
         await axios.get(url, { 
-          timeout: 2500, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+          timeout: 2000, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
           validateStatus: (status) => status >= 200 && status < 400
         });
         status = 'online';
@@ -137,7 +149,7 @@ async function checkStreamStatus(url: string): Promise<string> {
     }
     try {
       await axios.get(url, { 
-        timeout: 2500, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
+        timeout: 2000, headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
         validateStatus: (status) => status >= 200 && status < 400
       });
       statusCache.set(url, { status: 'online', time: Date.now() });
@@ -178,7 +190,7 @@ async function getStreamIndex() {
   } catch (err) { return streamIndex || new Map(); }
 }
 
-// --- BLAZING FAST SHARED STREAMING ENGINE ---
+// --- SHARED STREAMING ENGINE (DVR ENABLED) ---
 
 interface CachedSegment { url: string; data: Buffer; duration: number; }
 interface SharedStream {
@@ -188,6 +200,7 @@ interface SharedStream {
   viewers: number; isUpdating: boolean; timer?: NodeJS.Timeout;
 }
 const globalStreamRegistry = new Map<string, SharedStream>();
+const MAX_SEGMENTS_CACHE = 100; // Sliding window for DVR (approx 10-15 mins)
 
 async function runPuller(channelKey: string) {
   const shared = globalStreamRegistry.get(channelKey);
@@ -217,6 +230,7 @@ async function runPuller(channelKey: string) {
         return { url: seg.url, data: Buffer.from(res.data), duration: seg.duration };
       } catch (e) { return null; }
     }));
+
     if (!shared.initSegment && newSegs.length > 0 && newSegs[0]) {
        const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
        transmuxer.on('data', (event: any) => { if (event.initSegment) shared.initSegment = Buffer.from(event.initSegment); });
@@ -227,7 +241,7 @@ async function runPuller(channelKey: string) {
       if (s) {
         shared.segments.push(s);
         shared.totalTimeOffset += s.duration;
-        if (shared.segments.length > 25) shared.segments.shift();
+        if (shared.segments.length > MAX_SEGMENTS_CACHE) shared.segments.shift();
       }
     }
     shared.lastUpdate = Date.now();
@@ -248,14 +262,13 @@ async function getShared(channelKey: string, initialUrl: string, ua: string): Pr
     shared = { mediaPlaylistUrl: mediaUrl, userAgent: ua, segments: [], initSegment: null, totalTimeOffset: 0, lastUpdate: 0, viewers: 0, isUpdating: false };
     globalStreamRegistry.set(channelKey, shared);
     await runPuller(channelKey);
-    shared.timer = setInterval(() => runPuller(channelKey), 3000);
+    shared.timer = setInterval(() => runPuller(channelKey), 4000);
   }
   return shared;
 }
 
 /**
  * High-Performance Native MP4 Proxy
- * Architecture: Synchronous Handshake -> Background Delivery
  */
 router.get('/stream', async (c) => {
   const id = c.req.query('id');
@@ -265,10 +278,25 @@ router.get('/stream', async (c) => {
   try {
     const origId = await getOriginalId(id);
     const streams = await getStreamIndex();
-    const chStreams = streams.get(origId || id) || [];
-    const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-    if (allowed.length === 0) return c.json({ error: 'No supported streams' }, 404);
     
+    // Improved Case-Insensitive Lookup
+    const targetId = (origId || id).toLowerCase();
+    let chStreams = streams.get(origId || id) || [];
+    
+    if (chStreams.length === 0) {
+      for (const [key, list] of streams.entries()) {
+        if (key.toLowerCase() === targetId) {
+          chStreams = list;
+          break;
+        }
+      }
+    }
+
+    if (chStreams.length === 0) return c.json({ error: 'No streams found for this channel' }, 404);
+    
+    let allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+    if (allowed.length === 0) allowed = chStreams; 
+
     let idx = 0;
     if (res !== 'auto') { 
       const f = allowed.findIndex((s: any) => s.quality === res); 
@@ -277,7 +305,6 @@ router.get('/stream', async (c) => {
     let sel = allowed[idx];
     const ua = sel.user_agent || 'Mozilla/5.0';
 
-    // Status check
     const status = await axios.head(sel.url, { 
       timeout: 1500, 
       headers: { 'User-Agent': ua },
@@ -290,10 +317,9 @@ router.get('/stream', async (c) => {
     const channelKey = `${id}_${sel.quality}`;
     const shared = await getShared(channelKey, sel.url, ua);
 
-    // CRITICAL FIX: Wait for initSegment before opening the stream response
-    // This prevents the "stuck" state where browser doesn't know how to decode.
+    // CRITICAL: Wait for initSegment
     let waitCount = 0;
-    while (!shared.initSegment && waitCount < 10) {
+    while (!shared.initSegment && waitCount < 15) {
       await new Promise(r => setTimeout(r, 500));
       waitCount++;
     }
@@ -307,7 +333,6 @@ router.get('/stream', async (c) => {
     c.header('Access-Control-Allow-Origin', '*');
 
     return stream(c, async (stream) => {
-      // 1. Send the MP4 Header immediately
       await stream.write(shared.initSegment!);
 
       const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false, baseMediaDecodeTime: 0 });
@@ -325,7 +350,6 @@ router.get('/stream', async (c) => {
       const sent = new Set<string>();
       let offset = 0;
 
-      // 2. Warm Buffer (Fast Start)
       const warm = shared.segments.slice(-5);
       for (const s of warm) {
         if (closed) break;
@@ -336,7 +360,6 @@ router.get('/stream', async (c) => {
         sent.add(s.url);
       }
 
-      // 3. Live Loop
       try {
         shared.viewers++;
         while (!closed) {
@@ -383,28 +406,60 @@ export async function getOriginalId(shortId: string): Promise<string | null> {
 router.get('/', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
   const offset = parseInt(c.req.query('offset') || '0', 10);
-  const search = c.req.query('search');
-  const category = c.req.query('category');
-  const language = c.req.query('language');
+  
+  // Case-insensitive query parameters
+  const query = c.req.query();
+  const getParam = (key: string) => {
+    const k = key.toLowerCase();
+    for (const [qKey, val] of Object.entries(query)) {
+      if (qKey.toLowerCase() === k) return val;
+    }
+    return null;
+  };
+
+  const search = getParam('search');
+  const category = getParam('category');
+  const language = getParam('language');
+  const country = getParam('country');
+  const city = getParam('city');
+  const subdivision = getParam('subdivision');
+  const region = getParam('region');
+
   const protocol = c.req.header('x-forwarded-proto') || 'http';
   const baseUrl = `${protocol}://${c.req.header('host')}`;
+
   try {
-    const filters = { category, language };
-    const channels = await fetchChannelsSegmented(offset, limit, baseUrl, search, filters);
+    const filters = { 
+      category: category?.toString(), 
+      language: language?.toString(), 
+      country: country?.toString(), 
+      city: city?.toString(), 
+      subdivision: subdivision?.toString(), 
+      region: region?.toString() 
+    };
+    
+    const channels = await fetchChannelsSegmented(offset, limit, baseUrl, search?.toString(), filters);
+    const streams = await getStreamIndex();
+    
     const results = await Promise.all(channels.map(async (ch: any) => {
       const shortId = await getShortId(ch.id);
+      const chStreams = streams.get(ch.id) || [];
+      const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+      const primaryUrl = allowed.length > 0 ? allowed[0].url : null;
+      const status = await checkStreamStatus(primaryUrl);
+
       return { 
         ...ch, id: shortId, original_id: ch.id, 
         stream: `${baseUrl}/api/channels/stream?id=${shortId}`, 
         thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
         logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
-        status: 'online', 
-        available_resolutions: [], 
-        abr_supported: false
+        status, available_resolutions: allowed.map((s: any) => s.quality), abr_supported: allowed.length > 1
       };
     }));
     return c.json(results);
-  } catch (error: any) { return c.json({ error: 'List error' }, 500); }
+  } catch (error: any) { 
+    return c.json({ error: 'List error' }, 500); 
+  }
 });
 
 router.get('/:id', async (c) => {
@@ -450,22 +505,29 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
               
               if (filters.category && !ch.categories?.includes(filters.category)) continue;
               if (filters.language && !ch.languages?.includes(filters.language)) continue;
+              if (filters.country && ch.country !== filters.country) continue;
+              if (filters.city && ch.city !== filters.city) continue;
+              if (filters.subdivision && ch.subdivision !== filters.subdivision) continue;
+              if (filters.region && meta.countries.get(ch.country)?.region !== filters.region) continue;
 
-              const chStreams = streams.get(ch.id) || [];
               const matchesSearch = !searchLower || 
                 ch.name?.toLowerCase().includes(searchLower) || 
                 ch.id?.toLowerCase().includes(searchLower) ||
-                ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower));
+                ch.categories?.some((cat: string) => cat.toLowerCase().includes(searchLower)) ||
+                ch.country?.toLowerCase().includes(searchLower) ||
+                ch.city?.toLowerCase().includes(searchLower);
 
               if (!matchesSearch) continue;
               if (matchesFound < offset) { matchesFound++; } 
               else {
-                const countryInfo = meta.countries.get(ch.country);
+                const chStreams = streams.get(ch.id) || [];
                 const isGeoBlocked = chStreams.some((s: any) => s.label?.toLowerCase().includes('geo-blocked'));
                 const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
                 const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
+
                 results.push({
-                  ...ch, country_name: countryInfo?.name || null, region: countryInfo?.region || null,
+                  ...ch, country_name: meta.countries.get(ch.country)?.name || null, 
+                  region: meta.countries.get(ch.country)?.region || null,
                   languages_names: langNames, geo_blocked: isGeoBlocked,
                   highest_allowed_quality: allowed.length > 0 ? allowed[0].quality : null
                 });

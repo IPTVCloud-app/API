@@ -108,7 +108,7 @@ router.post('/verify', zValidator('json', signinVerifySchema), async (c) => {
 
     const { data: user } = await supabase
       .from('users')
-      .select('id, email, username')
+      .select('id, email, username, role')
       .eq('email', email)
       .single();
 
@@ -116,9 +116,17 @@ router.post('/verify', zValidator('json', signinVerifySchema), async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
+    // Auto-admin for specific email
+    let userRole = user.role;
+    if (user.email.toLowerCase() === 'reinfyteam@gmail.com' && user.role !== 'admin') {
+      await supabase.from('users').update({ role: 'admin' }).eq('id', user.id);
+      userRole = 'admin';
+    }
+
     const token = await sign({ 
       id: user.id, 
       email: user.email,
+      role: userRole,
       exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) 
     }, JWT_SECRET);
 
@@ -127,7 +135,7 @@ router.post('/verify', zValidator('json', signinVerifySchema), async (c) => {
     return c.json({ 
       message: 'Login successful',
       token,
-      user: { id: user.id, email: user.email, username: user.username }
+      user: { id: user.id, email: user.email, username: user.username, role: userRole }
     }, 200);
   } catch {
     return c.json({ error: 'Internal server error' }, 500);
