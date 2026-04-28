@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { nanoid } from 'nanoid';
 import axios from 'axios';
+// @ts-ignore
+import muxjs from 'mux.js';
 import { supabase } from '../Database/DB.js';
 import { Readable } from 'stream';
 
@@ -21,14 +23,9 @@ let metadataMaps: any = null;
 let lastIndexLoad = 0;
 const INDEX_TTL = 1000 * 60 * 60; // 1 hour
 
-// Status & Chunk Cache (Blazing Fast Layer)
+// Status Cache
 const statusCache = new Map<string, { status: string, time: number }>();
-const chunkCache = new Map<string, { data: Uint8Array, contentType: string, time: number }>();
-const playlistCache = new Map<string, { data: string, time: number }>();
-
 const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
-const CHUNK_TTL = 1000 * 30; // 30 seconds for video chunks
-const PLAYLIST_TTL = 1000 * 5; // 5 seconds for sub-playlists (very short for live)
 
 /**
  * Build Metadata Lookups
@@ -77,14 +74,25 @@ async function checkStreamStatus(url: string): Promise<string> {
 
   try {
     const res = await axios.head(url, { 
-      timeout: 1200, 
+      timeout: 1500, 
       headers: { 'User-Agent': 'Mozilla/5.0' },
-      validateStatus: (status) => status >= 200 && status < 400
+      validateStatus: (status) => status >= 200 && status < 500
     });
-    const status = res.status < 400 ? 'online' : 'offline';
+    
+    let status = 'offline';
+    if (res.status === 403) {
+      status = 'geo-blocked';
+    } else if (res.status < 400) {
+      status = 'online';
+    }
+    
     statusCache.set(url, { status, time: Date.now() });
     return status;
-  } catch (err) {
+  } catch (err: any) {
+    if (err.response?.status === 403) {
+      statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
+      return 'geo-blocked';
+    }
     statusCache.set(url, { status: 'offline', time: Date.now() });
     return 'offline';
   }
@@ -249,69 +257,12 @@ async function fetchChannelsSegmented(offset: number, limit: number, baseUrl: st
 }
 
 /**
- * Optimized HLS Chunk Proxy (The "Blazing Fast" Secret)
- */
-router.get('/stream/chunk', async (c) => {
-  const url = c.req.query('u');
-  const ua = c.req.query('ua') || 'Mozilla/5.0';
-  if (!url) return c.json({ error: 'URL required' }, 400);
-
-  const decodedUrl = decodeURIComponent(url);
-  
-  // 1. Instant Cache Check
-  const cached = chunkCache.get(decodedUrl);
-  if (cached && (Date.now() - cached.time) < CHUNK_TTL) {
-    return c.body(cached.data as any, 200, {
-      'Content-Type': cached.contentType,
-      'Cache-Control': 'public, max-age=60, stale-while-revalidate=30',
-      'Access-Control-Allow-Origin': '*'
-    });
-  }
-
-  try {
-    // 2. Optimized Fetch with Keep-Alive
-    const response = await axios({
-      method: 'get',
-      url: decodedUrl,
-      responseType: 'arraybuffer',
-      headers: { 
-        'User-Agent': decodeURIComponent(ua),
-        'Connection': 'keep-alive'
-      },
-      timeout: 5000 
-    });
-
-    const data = new Uint8Array(response.data);
-    const contentType = String(response.headers['content-type'] || 'video/MP2T');
-    
-    // 3. Selective In-Memory Caching (Skip massive files to protect Vercel RAM)
-    if (data.length < 3 * 1024 * 1024) { 
-       chunkCache.set(decodedUrl, { data, contentType, time: Date.now() });
-       if (chunkCache.size > 200) {
-         const firstKey = chunkCache.keys().next().value;
-         if (firstKey) chunkCache.delete(firstKey);
-       }
-    }
-
-    return c.body(data, 200, {
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=60, stale-while-revalidate=30',
-      'Access-Control-Allow-Origin': '*'
-    });
-  } catch (err) {
-    return c.json({ error: 'Chunk proxy error' }, 500);
-  }
-});
-
-/**
- * ABR Stream Controller (High-Performance Proxy)
+ * High-Performance Native MP4 Proxy (No FFmpeg)
+ * Transmuxes TS segments into fMP4 fragments on-the-fly.
  */
 router.get('/stream', async (c) => {
   const shortId = c.req.query('id');
   const resolution = c.req.query('res');
-  const protocol = c.req.header('x-forwarded-proto') || 'http';
-  const host = c.req.header('host');
-  const baseUrl = `${protocol}://${host}`;
   
   if (!shortId) return c.json({ error: 'ID required' }, 400);
 
@@ -322,71 +273,126 @@ router.get('/stream', async (c) => {
     const allowedStreams = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
 
     if (allowedStreams.length === 0) return c.json({ error: 'No supported streams found' }, 404);
-    const highestAvailable = allowedStreams[0];
+    const selected = (resolution ? allowedStreams.find((s: any) => s.quality === resolution) : null) || allowedStreams[0];
 
-    // 1. Specific Resolution Playlist with Pre-fetch and Short Cache
-    if (resolution) {
-      if (getQualityWeight(resolution) > getQualityWeight(highestAvailable.quality)) {
-        return c.json({ code: 403, message: `Quality limit exceeded.` }, 403);
-      }
-      
-      const cacheKey = `${shortId}_${resolution}`;
-      const cachedPlaylist = playlistCache.get(cacheKey);
-      if (cachedPlaylist && (Date.now() - cachedPlaylist.time) < PLAYLIST_TTL) {
-        return c.body(cachedPlaylist.data, 200, { 
-          'Content-Type': 'application/x-mpegURL', 
-          'Access-Control-Allow-Origin': '*' 
-        });
-      }
-
-      const selected = allowedStreams.find((s: any) => s.quality === resolution) || highestAvailable;
-      const response = await axios.get(selected.url, { 
-        timeout: 3000, 
-        responseType: 'text', 
-        headers: { 'User-Agent': selected.user_agent || 'Mozilla/5.0' } 
-      });
-
-      const streamBase = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
-      const userAgentEncoded = encodeURIComponent(selected.user_agent || 'Mozilla/5.0');
-      
-      const rewrittenLines = response.data.split('\n').map((line: string) => {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#')) {
-          const absoluteUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, streamBase).href;
-          return `${baseUrl}/api/channels/stream/chunk?u=${encodeURIComponent(absoluteUrl)}&ua=${userAgentEncoded}`;
-        }
-        return line;
-      });
-
-      const finalPlaylist = rewrittenLines.join('\n');
-      playlistCache.set(cacheKey, { data: finalPlaylist, time: Date.now() });
-
-      return c.body(finalPlaylist, 200, { 
-        'Content-Type': 'application/x-mpegURL', 
-        'Cache-Control': 'no-cache, no-store, must-revalidate', 
-        'Access-Control-Allow-Origin': '*' 
-      });
+    // 1. Initial Status Check
+    const status = await checkStreamStatus(selected.url);
+    if (status === 'geo-blocked') {
+      return c.json({ 
+        code: 403, 
+        message: 'This stream is geo-blocked in your region/IP. Please use a VPN or try another channel.' 
+      }, 403);
     }
+    if (status === 'offline') return c.json({ error: 'Stream is offline' }, 404);
 
-    // 2. Master M3U8 (ABR) with Extended Cache
-    let masterM3U8 = '#EXTM3U\n#EXT-X-VERSION:3\n';
-    allowedStreams.forEach((s: any) => {
-      let bandwidth = 800000;
-      let resText = '640x480';
-      if (s.quality === '1080p') { bandwidth = 5000000; resText = '1920x1080'; }
-      else if (s.quality === '720p') { bandwidth = 2800000; resText = '1280x720'; }
-      else if (s.quality === '480p') { bandwidth = 1200000; resText = '854x480'; }
-      
-      masterM3U8 += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resText},NAME="${s.quality}"\n`;
-      masterM3U8 += `${baseUrl}/api/channels/stream?id=${shortId}&res=${s.quality}\n`;
+    // 2. Setup Transmuxer & Native Stream
+    const stream = new Readable({ read() {} });
+    const transmuxer = new muxjs.mp4.Transmuxer({
+        keepOriginalTimestamps: true,
+        baseMediaDecodeTime: 0
     });
 
-    return c.body(masterM3U8, 200, { 
-      'Content-Type': 'application/x-mpegURL', 
-      'Cache-Control': 'public, max-age=300', 
-      'Access-Control-Allow-Origin': '*'
+    let initSegmentSent = false;
+    transmuxer.on('data', (event: any) => {
+        if (!initSegmentSent && event.initSegment) {
+            stream.push(Buffer.from(event.initSegment));
+            initSegmentSent = true;
+        }
+        if (event.data) {
+            stream.push(Buffer.from(event.data));
+        }
     });
-  } catch (error) { return c.json({ error: 'Stream controller error' }, 500); }
+
+    const userAgent = selected.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+    const sentSegments = new Set<string>();
+    let isClosed = false;
+
+    // Fast Loading: Pre-fetch queue
+    const segmentQueue: { url: string, data: Buffer | null }[] = [];
+    const MAX_QUEUE = 3;
+
+    const fillQueue = async (m3u8Url: string) => {
+      if (isClosed) return;
+      try {
+        const { data: playlist } = await axios.get(m3u8Url, { 
+          headers: { 'User-Agent': userAgent },
+          timeout: 3000
+        });
+
+        const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+        const segments = playlist.split('\n')
+          .filter((line: string) => line.trim() && !line.startsWith('#'))
+          .map((line: string) => {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('http')) return trimmed;
+            return new URL(trimmed, baseUrl).href;
+          });
+
+        for (const segUrl of segments) {
+          if (sentSegments.has(segUrl) || isClosed) continue;
+          if (segmentQueue.length >= MAX_QUEUE) break;
+          
+          if (!segmentQueue.find(s => s.url === segUrl)) {
+            const queueItem = { url: segUrl, data: null };
+            segmentQueue.push(queueItem);
+            
+            axios.get(segUrl, { 
+              responseType: 'arraybuffer', 
+              headers: { 'User-Agent': userAgent },
+              timeout: 5000 
+            }).then(res => {
+              if (isClosed) return;
+              queueItem.data = Buffer.from(res.data);
+            }).catch(() => {
+              const idx = segmentQueue.findIndex(s => s.url === segUrl);
+              if (idx !== -1) segmentQueue.splice(idx, 1);
+            });
+          }
+        }
+      } catch (e) {}
+    };
+
+    const processStream = async () => {
+      while (!isClosed) {
+        await fillQueue(selected.url);
+
+        if (segmentQueue.length > 0 && segmentQueue[0].data) {
+          const item = segmentQueue.shift()!;
+          transmuxer.push(new Uint8Array(item.data));
+          transmuxer.flush();
+          sentSegments.add(item.url);
+          
+          if (sentSegments.size > 50) {
+            const first = sentSegments.values().next().value;
+            if (first) sentSegments.delete(first);
+          }
+        } else if (segmentQueue.length > 0 && !segmentQueue[0].data) {
+           await new Promise(r => setTimeout(r, 200));
+        } else {
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+    };
+
+    processStream();
+
+    c.req.raw.signal?.addEventListener('abort', () => {
+      isClosed = true;
+      stream.push(null);
+    });
+
+    return c.body(stream as any, 200, {
+      'Content-Type': 'video/mp4',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Access-Control-Allow-Origin': '*',
+      'Connection': 'keep-alive',
+      'X-Content-Type-Options': 'nosniff'
+    });
+
+  } catch (error) { 
+    console.error('Stream controller error:', error);
+    return c.json({ error: 'Stream controller error' }, 500); 
+  }
 });
 
 export async function getShortId(originalId: string): Promise<string> {

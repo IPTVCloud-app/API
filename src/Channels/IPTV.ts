@@ -44,12 +44,25 @@ async function checkStreamStatus(url: string): Promise<string> {
     const res = await axios.head(url, { 
       timeout: 1500, 
       headers: { 'User-Agent': 'Mozilla/5.0' },
-      validateStatus: (status) => status >= 200 && status < 400
+      validateStatus: (status) => status >= 200 && status < 500
     });
-    const status = res.status < 400 ? 'online' : 'offline';
+    
+    let status = 'offline';
+    if (res.status === 403) {
+      status = 'geo-blocked';
+    } else if (res.status < 400) {
+      status = 'online';
+    }
+    
     statusCache.set(url, { status, time: Date.now() });
     return status;
-  } catch (err) {
+  } catch (err: any) {
+    if (err.response?.status === 403) {
+      statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
+      return 'geo-blocked';
+    }
+    
+    // Fallback for streams that block HEAD but allow GET
     try {
       await axios.get(url, { 
         timeout: 1500, 
@@ -58,9 +71,10 @@ async function checkStreamStatus(url: string): Promise<string> {
       });
       statusCache.set(url, { status: 'online', time: Date.now() });
       return 'online';
-    } catch (e) {
-      statusCache.set(url, { status: 'offline', time: Date.now() });
-      return 'offline';
+    } catch (e: any) {
+      const status = e.response?.status === 403 ? 'geo-blocked' : 'offline';
+      statusCache.set(url, { status, time: Date.now() });
+      return status;
     }
   }
 }
