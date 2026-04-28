@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { stream } from 'hono/streaming';
 import { nanoid } from 'nanoid';
 import axios from 'axios';
 // @ts-expect-error - mux.js doesn't have official types
@@ -290,81 +291,98 @@ router.get('/stream', async (c) => {
     }
     if (status === 'offline') return c.json({ error: 'Stream is offline' }, 404);
 
-    // 2. Setup Transmuxer & Native Stream
-    const stream = new Readable({ read() {} });
-    const transmuxer = new muxjs.mp4.Transmuxer({
+    const userAgent = selected.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+
+    c.header('Content-Type', 'video/mp4');
+    c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    c.header('Access-Control-Allow-Origin', '*');
+    c.header('Connection', 'keep-alive');
+    c.header('X-Content-Type-Options', 'nosniff');
+
+    // 2. Return Streaming Response
+    return stream(c, async (stream) => {
+      console.log(`[Stream] Starting native proxy for ${shortId}...`);
+      
+      const transmuxer = new muxjs.mp4.Transmuxer({
         keepOriginalTimestamps: true,
         baseMediaDecodeTime: 0
-    });
+      });
 
-    let initSegmentSent = false;
-    transmuxer.on('data', (event: any) => {
+      let initSegmentSent = false;
+      let isClosed = false;
+
+      // Pipe transmuxer data to Hono stream
+      transmuxer.on('data', (event: any) => {
         if (!initSegmentSent && event.initSegment) {
-            stream.push(Buffer.from(event.initSegment));
-            initSegmentSent = true;
+          stream.write(Buffer.from(event.initSegment));
+          initSegmentSent = true;
+          console.log('[Stream] Sent initSegment');
         }
         if (event.data) {
-            stream.push(Buffer.from(event.data));
+          stream.write(Buffer.from(event.data));
         }
-    });
+      });
 
-    const userAgent = selected.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-    const sentSegments = new Set<string>();
-    let isClosed = false;
+      const sentSegments = new Set<string>();
+      interface QueueItem { url: string, data: Buffer | null }
+      const segmentQueue: QueueItem[] = [];
+      const MAX_QUEUE = 3;
 
-    // Fast Loading: Pre-fetch queue
-    interface QueueItem { url: string, data: Buffer | null }
-    const segmentQueue: QueueItem[] = [];
-    const MAX_QUEUE = 3;
-
-    const fillQueue = async (m3u8Url: string) => {
-      if (isClosed) return;
-      try {
-        const { data: playlist } = await axios.get(m3u8Url, { 
-          headers: { 'User-Agent': userAgent },
-          timeout: 3000
-        });
-
-        const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
-        const segments = playlist.split('\n')
-          .filter((line: string) => line.trim() && !line.startsWith('#'))
-          .map((line: string) => {
-            const trimmed = line.trim();
-            if (trimmed.startsWith('http')) return trimmed;
-            return new URL(trimmed, baseUrl).href;
+      const fillQueue = async (m3u8Url: string) => {
+        if (isClosed) return;
+        try {
+          const { data: playlist } = await axios.get(m3u8Url, { 
+            headers: { 'User-Agent': userAgent },
+            timeout: 3000
           });
 
-        for (const segUrl of segments) {
-          if (sentSegments.has(segUrl) || isClosed) continue;
-          if (segmentQueue.length >= MAX_QUEUE) break;
-          
-          if (!segmentQueue.find(s => s.url === segUrl)) {
-            const queueItem: QueueItem = { url: segUrl, data: null };
-            segmentQueue.push(queueItem);
-            
-            axios.get(segUrl, { 
-              responseType: 'arraybuffer', 
-              headers: { 'User-Agent': userAgent },
-              timeout: 5000 
-            }).then(res => {
-              if (isClosed) return;
-              queueItem.data = Buffer.from(res.data);
-            }).catch(() => {
-              const idx = segmentQueue.findIndex(s => s.url === segUrl);
-              if (idx !== -1) segmentQueue.splice(idx, 1);
+          const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+          const segments = playlist.split('\n')
+            .filter((line: string) => line.trim() && !line.startsWith('#'))
+            .map((line: string) => {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('http')) return trimmed;
+              return new URL(trimmed, baseUrl).href;
             });
-          }
-        }
-      } catch (e) {}
-    };
 
-    const processStream = async () => {
+          for (const segUrl of segments) {
+            if (sentSegments.has(segUrl) || isClosed) continue;
+            if (segmentQueue.length >= MAX_QUEUE) break;
+            
+            if (!segmentQueue.find(s => s.url === segUrl)) {
+              const queueItem: QueueItem = { url: segUrl, data: null };
+              segmentQueue.push(queueItem);
+              
+              axios.get(segUrl, { 
+                responseType: 'arraybuffer', 
+                headers: { 'User-Agent': userAgent },
+                timeout: 5000 
+              }).then(res => {
+                if (isClosed) return;
+                queueItem.data = Buffer.from(res.data);
+              }).catch(() => {
+                const idx = segmentQueue.findIndex(s => s.url === segUrl);
+                if (idx !== -1) segmentQueue.splice(idx, 1);
+              });
+            }
+          }
+        } catch (e) {}
+      };
+
+      // Handle disconnect
+      c.req.raw.signal?.addEventListener('abort', () => {
+        console.log(`[Stream] Client disconnected from ${shortId}`);
+        isClosed = true;
+      });
+
+      // Main Loop
       while (!isClosed) {
         await fillQueue(selected.url);
 
         if (segmentQueue.length > 0 && segmentQueue[0].data) {
           const item = segmentQueue.shift()!;
           if (item.data) {
+            console.log(`[Stream] Processing segment: ${item.url.substring(item.url.lastIndexOf('/') + 1)}`);
             transmuxer.push(new Uint8Array(item.data));
             transmuxer.flush();
           }
@@ -375,26 +393,13 @@ router.get('/stream', async (c) => {
             if (first) sentSegments.delete(first);
           }
         } else if (segmentQueue.length > 0 && !segmentQueue[0].data) {
+           // Wait for segment download
            await new Promise(r => setTimeout(r, 200));
         } else {
+          // Wait for new segments in playlist
           await new Promise(r => setTimeout(r, 1000));
         }
       }
-    };
-
-    processStream();
-
-    c.req.raw.signal?.addEventListener('abort', () => {
-      isClosed = true;
-      stream.push(null);
-    });
-
-    return c.body(stream as any, 200, {
-      'Content-Type': 'video/mp4',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'Access-Control-Allow-Origin': '*',
-      'Connection': 'keep-alive',
-      'X-Content-Type-Options': 'nosniff'
     });
 
   } catch (error) { 
