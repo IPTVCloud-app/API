@@ -140,110 +140,130 @@ async function relayStream(c: Context, selected: StreamSource) {
   c.header('X-Accel-Buffering', 'no');
 
   return honoStream(c, async (stream) => {
-    const Transmuxer = (muxjs as any).mp4.Transmuxer;
+  const Transmuxer = (muxjs as any).mp4.Transmuxer;
 
-    const transmuxer = new Transmuxer({
-      keepOriginalTimestamps: true,
-      baseMediaDecodeTime: 0
-    });
+  const transmuxer = new Transmuxer({
+    keepOriginalTimestamps: true,
+    baseMediaDecodeTime: 0
+  });
 
-    let initSent = false;
-    let closed = false;
+  let initSent = false;
+  let closed = false;
 
-    const queue: QueueItem[] = [];
-    const sent = new Set<string>();
-    const MAX_QUEUE = 3;
+  const queue: QueueItem[] = [];
+  const sent = new Set<string>();
+  const MAX_QUEUE = 5;
 
-    transmuxer.on('data', (ev: any) => {
-      if (!initSent && ev.initSegment) {
-        stream.write(ev.initSegment);
-        initSent = true;
-      }
+  let processing = false;
 
-      if (ev.data) {
-        stream.write(ev.data);
-      }
-    });
-
-    stream.onAbort(() => {
-      closed = true;
-      transmuxer.dispose();
-    });
-
-    const fillQueue = async () => {
-      if (closed) return;
-
-      try {
-        const res = await axios.get<string>(selected.url, {
-          headers: { 'User-Agent': ua },
-          timeout: 4000,
-          responseType: 'text'
-        });
-
-        const playlist = res.data;
-        const base = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
-
-        const segments = playlist
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l && !l.startsWith('#'))
-          .map(l => {
-            try {
-              return new URL(l, base).href;
-            } catch {
-              return null;
-            }
-          })
-          .filter(Boolean) as string[];
-
-        for (const seg of segments) {
-          if (closed || sent.has(seg)) continue;
-          if (queue.length >= MAX_QUEUE) break;
-          if (queue.some(q => q.url === seg)) continue;
-
-          const item: QueueItem = { url: seg, data: null };
-          queue.push(item);
-
-          axios.get<ArrayBuffer>(seg, {
-            responseType: 'arraybuffer',
-            headers: { 'User-Agent': ua },
-            timeout: 8000
-          }).then(res => {
-            if (!closed) item.data = Buffer.from(res.data);
-          }).catch(() => {
-            const idx = queue.findIndex(q => q.url === seg);
-            if (idx !== -1) queue.splice(idx, 1);
-          });
-        }
-      } catch {}
-    };
-
-    while (!closed) {
-      await fillQueue();
-
-      const item = queue[0];
-
-      if (item?.data) {
-        queue.shift();
-
-        if (item.data) {
-          transmuxer.push(new Uint8Array(item.data));
-          transmuxer.flush();
-          sent.add(item.url);
-        }
-
-        if (sent.size > 60) {
-          const first = sent.values().next().value;
-          if (first) sent.delete(first);
-        }
-
-      } else {
-        await new Promise(r => setTimeout(r, 200));
-      }
+  transmuxer.on('data', (ev: any) => {
+    if (!initSent && ev.initSegment) {
+      stream.write(ev.initSegment);
+      initSent = true;
     }
+    if (ev.data) stream.write(ev.data);
+  });
 
+  stream.onAbort(() => {
+    closed = true;
     transmuxer.dispose();
   });
+
+  const fetchPlaylist = async () => {
+    try {
+      const res = await axios.get<string>(selected.url, {
+        headers: { 'User-Agent': ua },
+        timeout: 4000,
+        responseType: 'text'
+      });
+
+      const base = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
+
+      return res.data
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'))
+        .map(l => {
+          try {
+            return new URL(l, base).href;
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean) as string[];
+
+    } catch {
+      return [];
+    }
+  };
+
+  const fillQueue = async () => {
+    if (closed) return;
+
+    const segments = await fetchPlaylist();
+
+    for (const seg of segments) {
+      if (closed) break;
+      if (sent.has(seg)) continue;
+      if (queue.length >= MAX_QUEUE) break;
+      if (queue.some(q => q.url === seg)) continue;
+
+      const item: QueueItem = { url: seg, data: null };
+      queue.push(item);
+
+      axios.get<ArrayBuffer>(seg, {
+        responseType: 'arraybuffer',
+        headers: { 'User-Agent': ua },
+        timeout: 8000
+      }).then(res => {
+        if (!closed) item.data = Buffer.from(res.data);
+      }).catch(() => {});
+    }
+  };
+
+  const processQueue = async () => {
+    if (processing) return;
+    processing = true;
+
+    try {
+      const item = queue.shift();
+      if (!item?.data) return;
+
+      transmuxer.push(new Uint8Array(item.data));
+      sent.add(item.url);
+
+      if (sent.size > 60) {
+        const first = sent.values().next().value;
+        if (first) sent.delete(first);
+      }
+
+    } finally {
+      processing = false;
+    }
+  };
+
+  // 🔥 heartbeat prevents gateway timeout
+  const heartbeat = setInterval(() => {
+    if (closed) return clearInterval(heartbeat);
+    stream.write(new Uint8Array([0])); // keep-alive byte
+  }, 15000);
+
+  const loop = async () => {
+    while (!closed) {
+      await fillQueue();
+      await processQueue();
+      await new Promise(r => setTimeout(r, 150));
+    }
+  };
+
+  loop();
+
+  stream.onAbort(() => {
+    closed = true;
+    clearInterval(heartbeat);
+    transmuxer.dispose();
+  });
+});
 }
 
 /* -------------------------------------------------------
