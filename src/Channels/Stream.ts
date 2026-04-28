@@ -5,7 +5,7 @@ import { stream as honoStream } from 'hono/streaming';
 import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
 
-interface StreamSource {
+export interface StreamSource {
   url: string;
   quality: string;
   user_agent: string | null;
