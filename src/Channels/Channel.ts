@@ -24,33 +24,7 @@ const getQualityWeight = (q: string) => QUALITY_WEIGHTS[q] || 10;
 const isQualityTooHigh = (q: string) => getQualityWeight(q) > 100;
 
 /* -------------------------------------------------------
-   STATUS CACHE (FIX FOR SLOW + FALSE RESULTS)
-------------------------------------------------------- */
-const statusCache = new Map<string, { status: string; time: number }>();
-const STATUS_TTL = 1000 * 60 * 5; // 5 min cache
-
-async function getCachedStatus(url: string): Promise<string> {
-  if (!url) return 'offline';
-
-  const now = Date.now();
-  const cached = statusCache.get(url);
-
-  if (cached && now - cached.time < STATUS_TTL) {
-    return cached.status;
-  }
-
-  const status = await checkStreamStatus(url);
-
-  statusCache.set(url, {
-    status,
-    time: now
-  });
-
-  return status;
-}
-
-/* -------------------------------------------------------
-   STREAM INDEX PARSER (UNTOUCHED LOGIC, FIXED STATUS USAGE)
+   CHANNEL PARSER (OPTIMIZED WITH BATCH STATUS CHECKS)
 ------------------------------------------------------- */
 async function fetchChannelsSegmented(
   offset: number,
@@ -70,7 +44,7 @@ async function fetchChannelsSegmented(
 
   const streamData = response.data as Readable;
 
-  const results: any[] = [];
+  const candidates: any[] = [];
   let currentObject = '';
   let bracketDepth = 0;
   let matchesFound = 0;
@@ -108,98 +82,79 @@ async function fetchChannelsSegmented(
         if (bracketDepth === 0) {
           try {
             const ch = JSON.parse(currentObject);
-
             const chStreams = streams.get(ch.id.toLowerCase()) || [];
 
-            /* -------------------------------------------------------
-               PRIMARY STREAM (IMPORTANT FIX)
-            ------------------------------------------------------- */
-            const primaryStream =
-              chStreams.find((s: any) => !isQualityTooHigh(s.quality)) ||
-              chStreams[0];
+            /* ---------------- FILTERS ---------------- */
+            if (filters.category && !ch.categories?.some((c: string) => c.toLowerCase() === filters.category)) continue;
+            if (filters.language && !ch.languages?.some((l: string) => l.toLowerCase() === filters.language)) continue;
+            if (filters.country && ch.country?.toLowerCase() !== filters.country) continue;
+            if (filters.city && ch.city?.toLowerCase() !== filters.city) continue;
+            if (filters.subdivision && ch.subdivision?.toLowerCase() !== filters.subdivision) continue;
+            if (filters.region && meta.countries.get(ch.country)?.region?.toLowerCase() !== filters.region) continue;
 
-            const primaryUrl = primaryStream?.url;
-
-            /* -------------------------------------------------------
-               FILTERS
-            ------------------------------------------------------- */
-
-            if (filters.category &&
-                !ch.categories?.some((c: string) => c.toLowerCase() === filters.category)) continue;
-
-            if (filters.language &&
-                !ch.languages?.some((l: string) => l.toLowerCase() === filters.language)) continue;
-
-            if (filters.country &&
-                ch.country?.toLowerCase() !== filters.country) continue;
-
-            if (filters.city &&
-                ch.city?.toLowerCase() !== filters.city) continue;
-
-            if (filters.subdivision &&
-                ch.subdivision?.toLowerCase() !== filters.subdivision) continue;
-
-            if (filters.region &&
-                meta.countries.get(ch.country)?.region?.toLowerCase() !== filters.region) continue;
-
-            /* -------------------------------------------------------
-               SEARCH FILTER
-            ------------------------------------------------------- */
-            const matchesSearch =
-              !searchLower ||
+            /* ---------------- SEARCH ---------------- */
+            const matchesSearch = !searchLower ||
               ch.name?.toLowerCase().includes(searchLower) ||
               ch.id?.toLowerCase().includes(searchLower) ||
               ch.country?.toLowerCase().includes(searchLower) ||
-              ch.city?.toLowerCase().includes(searchLower) ||
               ch.categories?.some((c: string) => c.toLowerCase().includes(searchLower));
 
             if (!matchesSearch) continue;
 
-            /* -------------------------------------------------------
-               STATUS FILTER (FIXED LOGIC)
-            ------------------------------------------------------- */
-            let statusValue: string | null = null;
-
-            if (filters.status) {
-              statusValue = await getCachedStatus(primaryUrl);
-
-              // 🔥 FIX: prevents offline leaks
-              if (statusValue !== filters.status) continue;
-            }
-
-            /* -------------------------------------------------------
-               PAGINATION
-            ------------------------------------------------------- */
+            // Pagination (Metadata matches)
             if (matchesFound < offset) {
               matchesFound++;
               continue;
             }
 
+            const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
+            const primaryUrl = allowed[0]?.url || chStreams[0]?.url;
+
+            candidates.push({ ...ch, primaryUrl, chStreams, allowed });
             matchesFound++;
 
-            const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
-
-            const langNames =
-              ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
-
-            results.push({
-              ...ch,
-              country_name: meta.countries.get(ch.country)?.name || null,
-              region: meta.countries.get(ch.country)?.region || null,
-              languages_names: langNames,
-              available_resolutions: allowed.map((s: any) => s.quality),
-              status: statusValue
-            });
-
-            if (results.length >= limit) {
+            // We collect enough candidates to fulfill the limit after status filtering
+            // or we stop if we hit a reasonable buffer.
+            if (candidates.length >= limit * 2) {
               streamData.destroy();
-              return results;
+              break;
             }
           } catch (e) {}
         }
       } else if (bracketDepth > 0) {
         currentObject += char;
       }
+    }
+    if (bracketDepth === 0 && candidates.length >= limit * 2) break;
+  }
+
+  /* ---------------- BATCH STATUS CHECKS ---------------- */
+  // Process candidates in parallel batches to find 'online' ones if requested
+  const results: any[] = [];
+  const BATCH_SIZE = 20;
+
+  for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+    const batch = candidates.slice(i, i + BATCH_SIZE);
+    const checkedBatch = await Promise.all(batch.map(async (c) => {
+      const status = await checkStreamStatus(c.primaryUrl);
+      return { ...c, status };
+    }));
+
+    for (const ch of checkedBatch) {
+      if (filters.status && ch.status !== filters.status) continue;
+      
+      const langNames = ch.languages?.map((l: any) => meta.languages.get(l)).filter(Boolean) || [];
+      
+      results.push({
+        ...ch,
+        country_name: meta.countries.get(ch.country)?.name || null,
+        region: meta.countries.get(ch.country)?.region || null,
+        languages_names: langNames,
+        available_resolutions: ch.allowed.map((s: any) => s.quality),
+        primaryUrl: undefined, chStreams: undefined, allowed: undefined // Cleanup internal props
+      });
+
+      if (results.length >= limit) return results;
     }
   }
 
@@ -246,22 +201,13 @@ router.get('/', async (c) => {
     };
 
     const channels = await fetchChannelsSegmented(offset, limit, search?.toString(), filters);
-    const streams = await getStreamIndex();
 
     const results = await Promise.all(
       channels.map(async (ch: any) => {
         const shortId = await getShortId(ch.id);
-
+        const streams = await getStreamIndex();
         const chStreams = streams.get(ch.id.toLowerCase()) || [];
-
-        const allowed = chStreams.filter(
-          (s: any) => !isQualityTooHigh(s.quality)
-        );
-
-        const primaryUrl = allowed[0]?.url || chStreams[0]?.url;
-
-        // ⚡ cached status (no more false results or slow HEAD spam)
-        const statusValue = await getCachedStatus(primaryUrl);
+        const allowed = chStreams.filter((s: any) => !isQualityTooHigh(s.quality));
 
         return {
           ...ch,
@@ -270,21 +216,16 @@ router.get('/', async (c) => {
           stream: `${baseUrl}/api/channels/stream?id=${shortId}`,
           thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
           logo: `${baseUrl}/api/channels/logo?id=${shortId}`,
-          status: statusValue,
+          status: ch.status, // Already checked in fetchChannelsSegmented
           available_resolutions: allowed.map((s: any) => s.quality),
           abr_supported: allowed.length > 1
         };
       })
     );
 
-    let final = results;
-
-    if (status) {
-      final = results.filter((r) => r.status === status);
-    }
-
-    return c.json(final);
+    return c.json(results);
   } catch (error) {
+    console.error('[Channel List Error]', error);
     return c.json({ error: 'List error' }, 500);
   }
 });

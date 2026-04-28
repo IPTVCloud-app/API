@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import axios from 'axios';
+import { checkStreamStatus } from './Utils.js';
 
 const router = new Hono();
 
@@ -8,10 +9,6 @@ const BASE_URL = 'https://iptv-org.github.io/api';
 // Cache configuration
 const caches: Record<string, { data: any, lastLoad: number }> = {};
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
-
-// Status cache for streams (URL -> { status: string, time: number })
-const statusCache = new Map<string, { status: string, time: number }>();
-const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
 
 async function getCachedData(endpoint: string) {
   const now = Date.now();
@@ -28,65 +25,6 @@ async function getCachedData(endpoint: string) {
     console.error(`[IPTV] Failed to fetch ${endpoint}:`, err);
     if (caches[endpoint]) return caches[endpoint].data;
     throw err;
-  }
-}
-
-/**
- * Check if a stream is online
- */
-async function checkStreamStatus(url: string): Promise<string> {
-  if (!url) return 'offline';
-  const cached = statusCache.get(url);
-  if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
-
-  try {
-    // 1. Try HEAD request first (efficient)
-    const res = await axios.head(url, { 
-      timeout: 2500,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      validateStatus: (status) => status >= 200 && status < 500
-    });
-    
-    let status = 'offline';
-    if (res.status === 403) {
-      status = 'geo-blocked';
-    } else if (res.status < 400) {
-      status = 'online';
-    } else {
-      // 2. Fallback to GET for common error codes (some block HEAD but allow GET)
-      try {
-        await axios.get(url, { 
-          timeout: 2500, 
-          headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
-          validateStatus: (status) => status >= 200 && status < 400
-        });
-        status = 'online';
-      } catch (e) {}
-    }
-    
-    statusCache.set(url, { status, time: Date.now() });
-    return status;
-  } catch (err: any) {
-    const errStatus = err.response?.status;
-    if (errStatus === 403) {
-      statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
-      return 'geo-blocked';
-    }
-    
-    // Attempt one last GET fallback on generic error
-    try {
-      await axios.get(url, { 
-        timeout: 2500, 
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Range': 'bytes=0-0' },
-        validateStatus: (status) => status >= 200 && status < 400
-      });
-      statusCache.set(url, { status: 'online', time: Date.now() });
-      return 'online';
-    } catch (e: any) {
-      const finalStatus = e.response?.status === 403 ? 'geo-blocked' : 'offline';
-      statusCache.set(url, { status: finalStatus, time: Date.now() });
-      return finalStatus;
-    }
   }
 }
 
@@ -113,7 +51,7 @@ router.get('/streams', async (c) => {
     const data = await getCachedData('streams');
     const slice = data.slice(offset, offset + limit);
 
-    // Perform parallel status detection
+    // Perform parallel status detection using consolidated utility
     const results = await Promise.all(slice.map(async (s: any) => {
       const status = await checkStreamStatus(s.url);
       return {
