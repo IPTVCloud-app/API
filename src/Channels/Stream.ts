@@ -6,10 +6,6 @@ import { stream as honoStream } from 'hono/streaming';
 import muxjs from 'mux.js';
 import { getOriginalId } from './Utils.js';
 
-const router = new Hono();
-
-const STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
-
 /* -------------------------------------------------------
    TYPES
 ------------------------------------------------------- */
@@ -21,9 +17,16 @@ interface StreamSource {
   label?: string | null;
 }
 
+type QueueItem = {
+  url: string;
+  data: Buffer | null;
+};
+
 /* -------------------------------------------------------
-   QUALITY FILTER
+   CONSTANTS
 ------------------------------------------------------- */
+const STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
+
 const QUALITY_WEIGHTS: Record<string, number> = {
   '1080p': 100,
   '720p': 80,
@@ -36,7 +39,7 @@ const getQualityWeight = (q: string) => QUALITY_WEIGHTS[q] || 10;
 const isQualityTooHigh = (q: string) => getQualityWeight(q) > 100;
 
 /* -------------------------------------------------------
-   STREAM INDEX (UNCHANGED - STABLE)
+   STREAM INDEX CACHE
 ------------------------------------------------------- */
 let streamIndex: Map<string, StreamSource[]> | null = null;
 let lastIndexLoad = 0;
@@ -82,7 +85,7 @@ export async function getStreamIndex(): Promise<Map<string, StreamSource[]>> {
 }
 
 /* -------------------------------------------------------
-   STREAM STATUS (UNCHANGED)
+   STATUS CACHE
 ------------------------------------------------------- */
 const statusCache = new Map<string, { status: string; time: number }>();
 const STATUS_TTL = 1000 * 60 * 5;
@@ -94,10 +97,10 @@ async function checkStreamStatus(url: string, ua: string): Promise<string> {
   if (cached && Date.now() - cached.time < STATUS_TTL) return cached.status;
 
   try {
-    const res = await fetch(url, {
-      method: 'HEAD',
+    const res = await axios.head(url, {
+      timeout: 2000,
       headers: { 'User-Agent': ua },
-      signal: AbortSignal.timeout(2000)
+      validateStatus: (s) => s >= 200 && s < 500
     });
 
     let status = 'offline';
@@ -114,28 +117,10 @@ async function checkStreamStatus(url: string, ua: string): Promise<string> {
 }
 
 /* -------------------------------------------------------
-   FETCH WITH TIMEOUT
-------------------------------------------------------- */
-async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 10000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(t);
-    return res;
-  } catch (e) {
-    clearTimeout(t);
-    throw e;
-  }
-}
-
-/* -------------------------------------------------------
-   🔥 FIXED RELAY ENGINE (YOUR WORKING VERSION INTEGRATED)
+   RELAY STREAM (FIXED)
 ------------------------------------------------------- */
 async function relayStream(c: Context, selected: StreamSource) {
   const ua = selected.user_agent || 'Mozilla/5.0';
-  const referer = new URL(selected.url).origin;
 
   const status = await checkStreamStatus(selected.url, ua);
 
@@ -150,7 +135,7 @@ async function relayStream(c: Context, selected: StreamSource) {
   }
 
   c.header('Content-Type', 'video/mp4');
-  c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+  c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'keep-alive');
   c.header('X-Accel-Buffering', 'no');
 
@@ -163,88 +148,109 @@ async function relayStream(c: Context, selected: StreamSource) {
     });
 
     let initSent = false;
-    let active = true;
-    const seenSegments = new Set<string>();
+    let closed = false;
 
-    transmuxer.on('data', async (ev: any) => {
+    const queue: QueueItem[] = [];
+    const sent = new Set<string>();
+    const MAX_QUEUE = 3;
+
+    transmuxer.on('data', (ev: any) => {
       if (!initSent && ev.initSegment) {
         stream.write(ev.initSegment);
         initSent = true;
       }
+
       if (ev.data) {
         stream.write(ev.data);
       }
     });
 
     stream.onAbort(() => {
-      active = false;
+      closed = true;
       transmuxer.dispose();
     });
 
-    try {
-      while (active) {
-        const res = await fetchWithTimeout(selected.url, {
-          headers: { 'User-Agent': ua, 'Referer': referer }
-        }, 5000);
+    const fillQueue = async () => {
+      if (closed) return;
 
-        if (!res.ok) {
-          await stream.sleep(1500);
-          continue;
-        }
+      try {
+        const res = await axios.get<string>(selected.url, {
+          headers: { 'User-Agent': ua },
+          timeout: 4000,
+          responseType: 'text'
+        });
 
-        const manifest = await res.text();
-        const lines = manifest.split('\n');
+        const playlist = res.data;
+        const base = selected.url.substring(0, selected.url.lastIndexOf('/') + 1);
 
-        const segments: string[] = [];
-
-        for (const l of lines) {
-          const t = l.trim();
-          if (!t || t.startsWith('#')) continue;
-
-          try {
-            segments.push(new URL(t, selected.url).href);
-          } catch {}
-        }
-
-        // fast-forward live edge
-        if (seenSegments.size === 0 && segments.length > 3) {
-          segments.slice(0, -2).forEach(s => seenSegments.add(s));
-        }
+        const segments = playlist
+          .split('\n')
+          .map(l => l.trim())
+          .filter(l => l && !l.startsWith('#'))
+          .map(l => {
+            try {
+              return new URL(l, base).href;
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean) as string[];
 
         for (const seg of segments) {
-          if (!active || seenSegments.has(seg)) continue;
+          if (closed || sent.has(seg)) continue;
+          if (queue.length >= MAX_QUEUE) break;
+          if (queue.some(q => q.url === seg)) continue;
 
-          try {
-            const r = await fetchWithTimeout(seg, {
-              headers: { 'User-Agent': ua, 'Referer': referer }
-            }, 10000);
+          const item: QueueItem = { url: seg, data: null };
+          queue.push(item);
 
-            if (r.ok && active) {
-              const buf = new Uint8Array(await r.arrayBuffer());
-              transmuxer.push(buf);
-              transmuxer.flush();
-            }
-          } catch {}
+          axios.get<ArrayBuffer>(seg, {
+            responseType: 'arraybuffer',
+            headers: { 'User-Agent': ua },
+            timeout: 8000
+          }).then(res => {
+            if (!closed) item.data = Buffer.from(res.data);
+          }).catch(() => {
+            const idx = queue.findIndex(q => q.url === seg);
+            if (idx !== -1) queue.splice(idx, 1);
+          });
+        }
+      } catch {}
+    };
 
-          seenSegments.add(seg);
+    while (!closed) {
+      await fillQueue();
 
-          if (seenSegments.size > 60) {
-            const first = seenSegments.values().next().value;
-            if (first) seenSegments.delete(first);
-          }
+      const item = queue[0];
+
+      if (item?.data) {
+        queue.shift();
+
+        if (item.data) {
+          transmuxer.push(new Uint8Array(item.data));
+          transmuxer.flush();
+          sent.add(item.url);
         }
 
-        await stream.sleep(2000);
+        if (sent.size > 60) {
+          const first = sent.values().next().value;
+          if (first) sent.delete(first);
+        }
+
+      } else {
+        await new Promise(r => setTimeout(r, 200));
       }
-    } finally {
-      transmuxer.dispose();
     }
+
+    transmuxer.dispose();
   });
 }
 
 /* -------------------------------------------------------
-   ENTRY ROUTE (UNCHANGED)
+   ENTRY ROUTE
 ------------------------------------------------------- */
+const router = new Hono();
+
 router.get('/', async (c) => {
   const id = c.req.query('id');
   const res = c.req.query('res');
@@ -257,11 +263,11 @@ router.get('/', async (c) => {
   const index = await getStreamIndex();
   let list = index.get(key) || [];
 
+  list = list.filter(s => !isQualityTooHigh(s.quality));
+
   if (!list.length) {
     throw new HTTPException(404, { message: 'Stream not found' });
   }
-
-  list = list.filter(s => !isQualityTooHigh(s.quality)) || list;
 
   let selected = list[0];
 
