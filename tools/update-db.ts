@@ -25,7 +25,16 @@ async function updateDatabase() {
   }
 
   try {
-    const sql = postgres(connectionString, { ssl: 'require' });
+    const sql = postgres(connectionString, { 
+      ssl: 'require',
+      onnotice: (notice) => {
+        // Suppress "already exists, skipping" notices to keep output clean
+        if (notice.code === '42P07' || notice.message?.includes('already exists, skipping')) {
+          return;
+        }
+        console.log(`📝 DB Notice: ${notice.message}`);
+      }
+    });
     await sql.unsafe(sqlContent);
     console.log(`✅ Database schema applied successfully.`);
     await sql.end();

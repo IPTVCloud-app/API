@@ -10,7 +10,8 @@
     "lint": "eslint src/",
     "format": "prettier --write \"src/**/*.ts\"",
     "db:verify": "tsx tools/verify-db.ts",
-    "db:update": "tsx tools/update-db.ts"
+    "db:update": "tsx tools/update-db.ts",
+    "db:sync": "tsx tools/sync-iptv.ts"
   },
   "keywords": [],
   "author": "",
