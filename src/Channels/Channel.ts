@@ -5,43 +5,62 @@ import axios from 'axios';
 
 const router = new Hono();
 
-// Memory cache for the current execution instance
+// Memory cache for the current execution instance (ephemeral)
 const statusCache = new Map<string, { status: string, time: number }>();
-const STATUS_TTL_MS = 15 * 60 * 1000; // 15 Minutes
+const DB_CACHE_TTL_MS = 1 * 60 * 1000; // 1 Minute for database persistence
+const AXIOS_TIMEOUT = 2000; // 2 seconds for Vercel stability
 
 /**
- * Fast Stream Status Checker
+ * High-Performance Stream Status Checker
+ * 1. Tries HEAD request (no content download)
+ * 2. Falls back to minimal GET (byte-range) if HEAD is blocked
  */
 async function checkStreamStatus(url: string): Promise<string> {
   if (!url) return 'offline';
   
-  // 1. Check Instance Memory (Fastest)
+  // Instance Memory Check (Speed)
   const cached = statusCache.get(url);
-  if (cached && (Date.now() - cached.time) < STATUS_TTL_MS) return cached.status;
+  if (cached && (Date.now() - cached.time) < DB_CACHE_TTL_MS) return cached.status;
+
+  const headers = { 
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) IPTVCloud/1.0',
+    'Range': 'bytes=0-0' // Request only first byte to prevent download
+  };
 
   try {
-    // 2. Perform a very fast HEAD request (Max 1.5s timeout for Vercel stability)
-    const res = await axios.head(url, { 
-      timeout: 1500, 
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) IPTVCloud/1.0' },
+    // Phase 1: Try HEAD (Fastest, no body)
+    const headRes = await axios.head(url, { 
+      timeout: AXIOS_TIMEOUT, 
+      headers,
       validateStatus: (status) => status >= 200 && status < 500
     });
     
-    let status = 'offline';
-    if (res.status === 403) status = 'geo-blocked';
-    else if (res.status < 400) status = 'online';
+    if (headRes.status < 400) return 'online';
+    if (headRes.status === 403) return 'geo-blocked';
+
+    // Phase 2: Fallback to small GET (some servers block HEAD)
+    const getRes = await axios.get(url, { 
+      timeout: AXIOS_TIMEOUT, 
+      headers,
+      responseType: 'stream', // Don't download full body
+      validateStatus: (status) => status >= 200 && status < 500
+    });
+
+    // Close stream immediately to prevent download
+    if (getRes.data?.destroy) getRes.data.destroy();
+
+    if (getRes.status < 400) return 'online';
+    if (getRes.status === 403) return 'geo-blocked';
     
-    statusCache.set(url, { status, time: Date.now() });
-    return status;
+    return 'offline';
   } catch (err: any) {
-    const status = err.response?.status === 403 ? 'geo-blocked' : 'offline';
-    statusCache.set(url, { status, time: Date.now() });
-    return status;
+    if (err.response?.status === 403) return 'geo-blocked';
+    return 'offline';
   }
 }
 
 /**
- * Optimized Channel Listing - Vercel & Performance Compatible
+ * Optimized Channel Listing - Vercel Serverless Compatible
  */
 router.get('/', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
@@ -53,9 +72,10 @@ router.get('/', async (c) => {
   const statusFilter = c.req.query('status');
 
   try {
-    // Fetch a bit more if we are filtering by online to account for potential drops
-    const fetchLimit = statusFilter === 'online' ? limit + 10 : limit;
+    // Over-fetch slightly to fulfill limit after status filtering
+    const fetchLimit = statusFilter === 'online' ? limit + 15 : limit;
     
+    // Construct query
     let query = supabase
       .from('iptv_channels')
       .select(`
@@ -69,10 +89,18 @@ router.get('/', async (c) => {
       `)
       .range(offset, offset + fetchLimit - 1);
 
-    if (search) query = query.or(`name.ilike.%${search}%,id.ilike.%${search}%`);
-    if (country) query = query.eq('country', country.toUpperCase());
-    if (category) query = query.contains('categories', [category]);
-    if (language) query = query.contains('languages', [language]);
+    if (search) {
+      query = query.or(`name.ilike.%${search}%,id.ilike.%${search}%`);
+    }
+    if (country) {
+      query = query.eq('country', country.toUpperCase());
+    }
+    if (category) {
+      query = query.contains('categories', [category]);
+    }
+    if (language) {
+      query = query.contains('languages', [language]);
+    }
 
     const { data: channels, error } = await query;
     if (error) throw error;
@@ -87,35 +115,29 @@ router.get('/', async (c) => {
         if (streams.length === 0) return null;
 
         const primary = streams[0];
-        let currentStatus = primary.status;
+        let status = primary.status;
         const lastChecked = primary.last_checked_at ? new Date(primary.last_checked_at).getTime() : 0;
+        const isExpired = (now - lastChecked) > DB_CACHE_TTL_MS;
 
-        /**
-         * Persistance Logic:
-         * Only re-check if:
-         * 1. Status is 'unknown'
-         * 2. Status is older than 15 minutes AND we specifically need 'online' results
-         */
-        const isExpired = (now - lastChecked) > STATUS_TTL_MS;
-        
-        if (currentStatus === 'unknown' || (isExpired && statusFilter === 'online')) {
-          currentStatus = await checkStreamStatus(primary.url);
+        // Smart Update: Only re-check if unknown, expired, or online filter requested
+        if (status === 'unknown' || isExpired || statusFilter === 'online') {
+          const newStatus = await checkStreamStatus(primary.url);
           
-          // Fire-and-forget DB update to keep response fast
-          if (currentStatus !== primary.status || isExpired) {
+          // Asynchronous DB Update (Fire-and-forget for Vercel speed)
+          if (newStatus !== status || isExpired) {
+            status = newStatus;
             supabase
               .from('iptv_streams')
-              .update({ status: currentStatus, last_checked_at: new Date().toISOString() })
+              .update({ status: newStatus, last_checked_at: new Date().toISOString() })
               .eq('channel_id', ch.id)
               .eq('url', primary.url)
-              .then(() => {})
-              .catch(() => {});
+              .then(() => {});
           }
         }
 
-        // Apply filtering logic
-        if (statusFilter === 'online' && currentStatus !== 'online') return null;
-        if (statusFilter && statusFilter !== 'online' && currentStatus !== statusFilter) return null;
+        // Apply dynamic status filtering
+        if (statusFilter === 'online' && status !== 'online') return null;
+        if (statusFilter && statusFilter !== 'online' && status !== statusFilter) return null;
 
         const shortId = await getShortId(ch.id);
         return {
@@ -130,14 +152,15 @@ router.get('/', async (c) => {
           languages: ch.languages,
           stream: `${baseUrl}/api/channels/stream?id=${shortId}`,
           thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
-          status: currentStatus,
+          status,
           available_resolutions: streams.map((s: any) => s.quality).filter(Boolean),
           abr_supported: streams.length > 1
         };
       })
     );
 
-    return c.json(results.filter(Boolean).slice(0, limit));
+    const final = results.filter(Boolean).slice(0, limit);
+    return c.json(final);
   } catch (error) {
     console.error('[Channel List Error]', error);
     return c.json({ error: 'Failed to fetch channels' }, 500);
