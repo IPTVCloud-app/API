@@ -62,7 +62,8 @@ async function updateChannels() {
 
     // 3. Sync Streams
     console.log('🔗 Syncing stream URLs...');
-    const { data: allStreams } = await axios.get(`${IPTV_ORG_BASE}/streams.json`);
+    const { data: allStreamsData } = await axios.get('https://iptvcloud-app.github.io/EPG/streams.json');
+    const allStreams = Array.isArray(allStreamsData) ? allStreamsData : (allStreamsData.streams || []);
     
     // Build a set of known channel IDs from the channels we just synced
     const channelIds = new Set(allChannels.map((c: any) => c.id));
@@ -77,9 +78,9 @@ async function updateChannels() {
       await sql`
         INSERT INTO iptv_streams ${sql(batch.map((s: any) => ({
           channel_id: s.channel, url: s.url, quality: s.quality || null,
-          width: s.width || null, height: s.height || null, last_checked_at: new Date()
+          width: s.width || null, height: s.height || null, status: s.status || 'unknown', last_checked_at: new Date()
         })))} ON CONFLICT (channel_id, url) DO UPDATE SET
-          quality = EXCLUDED.quality, width = EXCLUDED.width, height = EXCLUDED.height
+          quality = EXCLUDED.quality, width = EXCLUDED.width, height = EXCLUDED.height, status = EXCLUDED.status, last_checked_at = EXCLUDED.last_checked_at
       `;
     }
 

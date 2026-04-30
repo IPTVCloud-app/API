@@ -3,7 +3,7 @@ import axios from 'axios';
 
 const router = new Hono();
 
-const STREAMS_URL = 'https://iptv-org.github.io/api/streams.json';
+const STREAMS_URL = 'https://iptvcloud-app.github.io/EPG/streams.json';
 
 let streamIndex: Map<string, any[]> | null = null;
 let lastLoad = 0;
@@ -19,8 +19,9 @@ async function getStreamIndex() {
   const map = new Map<string, any[]>();
 
   const res = await axios.get(STREAMS_URL);
+  const data = Array.isArray(res.data) ? res.data : (res.data.streams || []);
 
-  for (const s of res.data) {
+  for (const s of data) {
     if (!s.channel) continue;
 
     const list = map.get(s.channel) || [];

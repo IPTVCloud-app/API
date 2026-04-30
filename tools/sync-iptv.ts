@@ -97,7 +97,8 @@ async function syncIPTV() {
 
     // 5. Sync Streams
     console.log('🔗 Syncing streams...');
-    const { data: streams } = await axios.get(`${IPTV_ORG_BASE}/streams.json`);
+    const { data: streamsData } = await axios.get('https://iptvcloud-app.github.io/EPG/streams.json');
+    const streams = Array.isArray(streamsData) ? streamsData : (streamsData.streams || []);
     
     // Build a set of known channel IDs from the channels we just synced
     const channelIds = new Set(channels.map((c: any) => c.id));
@@ -119,6 +120,7 @@ async function syncIPTV() {
           quality: s.quality || null,
           width: s.width || null,
           height: s.height || null,
+          status: s.status || 'unknown',
           last_checked_at: new Date()
         })))}
         ON CONFLICT (channel_id, url) DO UPDATE SET
@@ -128,6 +130,7 @@ async function syncIPTV() {
           quality = EXCLUDED.quality,
           width = EXCLUDED.width,
           height = EXCLUDED.height,
+          status = EXCLUDED.status,
           last_checked_at = EXCLUDED.last_checked_at
       `;
       console.log(`   Processed ${Math.min(i + BATCH_SIZE, validStreams.length)}/${validStreams.length} streams...`);
