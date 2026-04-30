@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import axios from 'axios';
+import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
 
@@ -18,21 +19,51 @@ async function getStreamIndex() {
 
   const map = new Map<string, any[]>();
 
-  const res = await axios.get(STREAMS_URL);
-  const data = Array.isArray(res.data) ? res.data : (res.data.streams || []);
+  try {
+    const res = await axios.get(STREAMS_URL);
+    const data = Array.isArray(res.data) ? res.data : (res.data.streams || []);
 
-  for (const s of data) {
-    if (!s.channel) continue;
+    for (const s of data) {
+      if (!s.channel) continue;
+      const list = map.get(s.channel) || [];
+      list.push({ url: s.url });
+      map.set(s.channel, list);
+    }
 
-    const list = map.get(s.channel) || [];
-    list.push({ url: s.url });
-    map.set(s.channel, list);
+    streamIndex = map;
+    lastLoad = now;
+  } catch (err) {
+    console.error('Failed to load stream index:', err);
   }
 
-  streamIndex = map;
-  lastLoad = now;
-
   return map;
+}
+
+/**
+ * Robust Manifest Rewriter
+ * Handles both Master and Media playlists
+ */
+function rewriteManifest(content: string, baseUrl: string, channelId: string): string {
+  const lines = content.split('\n');
+  const base = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+
+  return lines.map(line => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return line;
+
+    // Convert relative to absolute
+    let absUrl = t;
+    try {
+      if (!t.startsWith('http')) {
+        absUrl = new URL(t, base).href;
+      }
+    } catch (e) {
+      return line;
+    }
+
+    // Proxy everything through our endpoint
+    return `/api/channels/stream?id=${channelId}&segment=${encodeURIComponent(absUrl)}`;
+  }).join('\n');
 }
 
 router.get('/stream', async (c) => {
@@ -41,72 +72,63 @@ router.get('/stream', async (c) => {
 
   if (!id) return c.json({ error: 'Missing id' }, 400);
 
-  const streams = await getStreamIndex();
-  const list = streams.get(id);
+  // Resolve shortId to originalId
+  const originalId = await getOriginalId(id);
 
-  if (!list?.length) {
+  const streams = await getStreamIndex();
+  const list = streams.get(originalId);
+
+  // If no segment is requested, we are fetching the initial manifest
+  const targetUrl = segment ? decodeURIComponent(segment) : (list?.[0]?.url);
+
+  if (!targetUrl) {
     return c.json({ error: 'Stream not found' }, 404);
   }
 
-  const source = list[0].url;
-
-  if (segment) {
-    try {
-      const url = decodeURIComponent(segment);
-
-      const res = await axios.get(url, {
-        responseType: 'stream',
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0'
-        }
-      });
-
-      return new Response(res.data, {
-        headers: {
-          'Content-Type': 'video/MP2T',
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'public, max-age=10'
-        }
-      });
-    } catch {
-      return c.text('segment error', 500);
-    }
-  }
-
   try {
-    const res = await axios.get(source, {
-      timeout: 8000,
+    const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       }
     });
 
-    const base = source.substring(0, source.lastIndexOf('/') + 1);
+    if (!response.ok) {
+      throw new Error(`Upstream returned ${response.status}`);
+    }
 
-    const rewritten = res.data
-      .split('\n')
-      .map((line: string) => {
-        const t = line.trim();
+    const contentType = response.headers.get('Content-Type') || '';
+    const isManifest = targetUrl.toLowerCase().includes('.m3u8') || 
+                       contentType.includes('mpegurl') || 
+                       contentType.includes('application/x-mpegurl');
 
-        if (!t || t.startsWith('#')) return line;
+    if (isManifest) {
+      const text = await response.text();
+      const rewritten = rewriteManifest(text, targetUrl, id);
 
-        const abs = t.startsWith('http')
-          ? t
-          : new URL(t, base).href;
-        return `/api/channels/stream?id=${id}&segment=${encodeURIComponent(abs)}`;
+      return new Response(rewritten, {
+        headers: {
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0'
+        }
       });
+    }
 
-    return new Response(rewritten.join('\n'), {
+    // For segments (binary data)
+    return new Response(response.body, {
       headers: {
-        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Content-Type': contentType || 'video/MP2T',
         'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-cache'
+        'Cache-Control': 'public, max-age=3600',
+        'Accept-Ranges': 'bytes'
       }
     });
 
-  } catch {
-    return c.json({ error: 'manifest failed' }, 500);
+  } catch (error: any) {
+    console.error(`[Proxy Error] ${targetUrl}:`, error.message);
+    return c.json({ error: 'Failed to proxy stream', detail: error.message }, 502);
   }
 });
 
