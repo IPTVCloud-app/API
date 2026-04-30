@@ -8,7 +8,7 @@ const app = new Hono();
  * Batch Channel Status Check
  * Designed to be called by a Vercel Cron Job
  */
-app.get('/check', async (c) => {
+app.get('/', async (c) => {
   const BATCH_SIZE = 100;
   const CONCURRENCY = 10;
 

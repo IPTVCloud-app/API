@@ -66,7 +66,7 @@ function rewriteManifest(content: string, baseUrl: string, channelId: string): s
   }).join('\n');
 }
 
-router.get('/stream', async (c) => {
+router.get('/', async (c) => {
   const id = c.req.query('id');
   const segment = c.req.query('segment');
 

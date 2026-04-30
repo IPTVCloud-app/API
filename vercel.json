@@ -15,5 +15,15 @@
       "src": "/(.*)",
       "dest": "src/API.ts"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/admin/cleanup",
+      "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/channels/status",
+      "schedule": "0 * * * *"
+    }
   ]
 }
