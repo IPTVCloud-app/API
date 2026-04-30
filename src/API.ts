@@ -17,6 +17,7 @@ import streamRouter from './Channels/Stream.js';
 import thumbnail from './Channels/Thumbnail.js';
 import logo from './Channels/Logo.js';
 import metadata from './Channels/Metadata.js';
+import wiki from './Channels/Wiki.js';
 import profile from './Social/Profile.js';
 import follow from './Social/Follow.js';
 import adminDashboard from './Admin/Dashboard.js';
