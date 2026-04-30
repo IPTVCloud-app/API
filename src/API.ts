@@ -70,6 +70,23 @@ app.get('/api/health', (c) => {
   return c.json({ status: 'ok', time: new Date().toISOString(), database: !!supabase });
 });
 
+app.get('/api/image', async (c) => {
+  const src = c.req.query('src');
+  if (!src) return c.json({ error: 'Source required' }, 400);
+
+  // Security: Prevent directory traversal
+  const safeSrc = src.replace(/\.\.\//g, '');
+  const assetPath = path.resolve(process.cwd(), '..', 'Assets', safeSrc);
+
+  if (fs.existsSync(assetPath)) {
+    const ext = path.extname(assetPath).toLowerCase();
+    const contentType = ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : 'application/octet-stream';
+    return c.body(fs.readFileSync(assetPath) as any, 200, { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=3600' });
+  }
+
+  return c.json({ error: 'Image not found' }, 404);
+});
+
 app.get('/api/admin/cleanup', (c) => {
   console.log('🧹 Running daily thumbnail cleanup...');
   const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');

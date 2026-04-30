@@ -11,7 +11,8 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "db:verify": "tsx tools/verify-db.ts",
     "db:update": "tsx tools/update-db.ts",
-    "db:sync": "tsx tools/sync-iptv.ts"
+    "db:sync": "tsx tools/sync-iptv.ts",
+    "db:update-channels": "tsx tools/update-channels.ts"
   },
   "keywords": [],
   "author": "",

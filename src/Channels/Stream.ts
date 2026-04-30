@@ -20,37 +20,83 @@ const statusCache = new Map<string, { status: string, time: number }>();
 const STATUS_TTL = 1000 * 60 * 5; // 5 minutes
 
 /**
- * Check if a stream is online
+ * Lightweight p-limit replacement to avoid adding dependencies
  */
-async function checkStreamStatus(url: string): Promise<string> {
+export function pLimit(concurrency: number) {
+  const queue: (() => Promise<any>)[] = [];
+  let activeCount = 0;
+
+  const next = () => {
+    if (queue.length === 0 || activeCount >= concurrency) return;
+    activeCount++;
+    const fn = queue.shift()!;
+    fn().finally(() => {
+      activeCount--;
+      next();
+    });
+  };
+
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    return new Promise((resolve, reject) => {
+      queue.push(() => fn().then(resolve).catch(reject));
+      next();
+    });
+  };
+}
+
+/**
+ * Advanced 3-Stage Stream Status Checker
+ */
+export async function checkStreamStatus(url: string): Promise<string> {
   if (!url) return 'offline';
   const cached = statusCache.get(url);
   if (cached && (Date.now() - cached.time) < STATUS_TTL) return cached.status;
 
+  const headers = { 
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) IPTVCloud/1.0',
+    'Range': 'bytes=0-511' // Request only first 512 bytes for validation
+  };
+
   try {
-    const res = await axios.head(url, { 
-      timeout: 1500, 
-      headers: { 'User-Agent': 'Mozilla/5.0' },
+    // Stage 1: Fast HEAD request
+    try {
+      const headRes = await axios.head(url, { 
+        timeout: 2000, 
+        headers,
+        validateStatus: (status) => status >= 200 && status < 500
+      });
+      if (headRes.status === 403) return cacheStatus(url, 'geo-blocked');
+      // If HEAD is successful and returns 200/206, we still do a quick GET check for HLS signature 
+      // because many IPTV links return 200 for fake offline pages.
+    } catch (e) {
+      // HEAD failed, fallback to GET
+    }
+
+    // Stage 2 & 3: Minimal GET and Validation
+    const getRes = await axios.get(url, { 
+      timeout: 3000, 
+      headers,
+      responseType: 'text',
       validateStatus: (status) => status >= 200 && status < 500
     });
+
+    if (getRes.status === 403) return cacheStatus(url, 'geo-blocked');
+    if (getRes.status >= 400) return cacheStatus(url, 'offline');
+
+    const body = getRes.data || '';
+    const isHLS = body.includes('#EXTM3U') || body.includes('#EXTINF') || body.includes('#EXT-X-STREAM-INF');
     
-    let status = 'offline';
-    if (res.status === 403) {
-      status = 'geo-blocked';
-    } else if (res.status < 400) {
-      status = 'online';
-    }
-    
-    statusCache.set(url, { status, time: Date.now() });
-    return status;
+    const status = isHLS ? 'online' : 'offline';
+    return cacheStatus(url, status);
   } catch (err: any) {
-    if (err.response?.status === 403) {
-      statusCache.set(url, { status: 'geo-blocked', time: Date.now() });
-      return 'geo-blocked';
-    }
-    statusCache.set(url, { status: 'offline', time: Date.now() });
-    return 'offline';
+    if (err.response?.status === 403) return cacheStatus(url, 'geo-blocked');
+    return cacheStatus(url, 'offline');
   }
+}
+
+function cacheStatus(url: string, status: string): string {
+  statusCache.set(url, { status, time: Date.now() });
+  return status;
 }
 
 /**
@@ -245,13 +291,41 @@ router.get('/stream', async (c) => {
 });
 
 export async function getShortId(originalId: string): Promise<string> {
+  const map = await getShortIds([originalId]);
+  return map[originalId] || originalId;
+}
+
+export async function getShortIds(originalIds: string[]): Promise<Record<string, string>> {
   try {
-    const { data: existing } = await supabase.from('channel_mappings').select('short_id').eq('original_id', originalId).single();
-    if (existing) return existing.short_id;
-    const shortId = nanoid(12);
-    await supabase.from('channel_mappings').insert([{ original_id: originalId, short_id: shortId }]);
-    return shortId;
-  } catch (err) { return originalId; }
+    const { data: existing } = await supabase
+      .from('channel_mappings')
+      .select('original_id, short_id')
+      .in('original_id', originalIds);
+
+    const mapping: Record<string, string> = {};
+    (existing || []).forEach(m => {
+      mapping[m.original_id] = m.short_id;
+    });
+
+    const missing = originalIds.filter(id => !mapping[id]);
+    if (missing.length > 0) {
+      const newMappings = missing.map(id => ({ original_id: id, short_id: nanoid(12) }));
+      const { data: inserted } = await supabase
+        .from('channel_mappings')
+        .insert(newMappings)
+        .select();
+      
+      (inserted || []).forEach(m => {
+        mapping[m.original_id] = m.short_id;
+      });
+    }
+
+    return mapping;
+  } catch (err) {
+    const fallback: Record<string, string> = {};
+    originalIds.forEach(id => fallback[id] = id);
+    return fallback;
+  }
 }
 
 export async function getOriginalId(shortId: string): Promise<string | null> {
