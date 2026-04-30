@@ -69,6 +69,42 @@ export async function getShortId(originalId: string): Promise<string> {
   } catch (err) { return originalId; }
 }
 
+export async function getShortIds(originalIds: string[]): Promise<Record<string, string>> {
+  if (originalIds.length === 0) return {};
+  try {
+    const { data: mappings } = await supabase
+      .from('channel_mappings')
+      .select('original_id, short_id')
+      .in('original_id', originalIds);
+
+    const map: Record<string, string> = {};
+    const existingIds = new Set();
+
+    if (mappings) {
+      for (const m of mappings) {
+        map[m.original_id] = m.short_id;
+        existingIds.add(m.original_id);
+      }
+    }
+
+    const missingIds = originalIds.filter(id => !existingIds.has(id));
+    if (missingIds.length > 0) {
+      const newMappings = missingIds.map(id => ({
+        original_id: id,
+        short_id: nanoid(12)
+      }));
+      await supabase.from('channel_mappings').insert(newMappings);
+      for (const nm of newMappings) {
+        map[nm.original_id] = nm.short_id;
+      }
+    }
+
+    return map;
+  } catch (err) {
+    return originalIds.reduce((acc, id) => ({ ...acc, [id]: id }), {});
+  }
+}
+
 export async function getOriginalId(shortId: string): Promise<string | null> {
   try {
     const { data: existing } = await supabase.from('channel_mappings').select('original_id').eq('short_id', shortId).single();
