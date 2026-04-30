@@ -20,6 +20,10 @@ const signinVerifySchema = z.object({
   code: z.string().length(6),
 });
 
+const resendOtpSchema = z.object({
+  email: z.string().email(),
+});
+
 const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 const createOrUpdateOtp = async (email: string, type: 'login' | 'reset' | 'verify_email' | 'change_username') => {
@@ -54,6 +58,20 @@ const createOrUpdateOtp = async (email: string, type: 'login' | 'reset' | 'verif
 
   return code;
 };
+
+/**
+ * Endpoint to resend OTP
+ */
+router.post('/resend', zValidator('json', resendOtpSchema), async (c) => {
+  const { email } = c.req.valid('json');
+  try {
+    const code = await createOrUpdateOtp(email, 'login');
+    await sendVerificationEmail(email, code);
+    return c.json({ message: 'Verification code resent' }, 200);
+  } catch (error: any) {
+    return c.json({ error: error.message || 'Internal server error' }, 500);
+  }
+});
 
 /**
  * Step 1: Initialize Sign-in (Credentials + OTP Send)

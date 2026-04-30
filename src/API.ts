@@ -14,6 +14,7 @@ import credentials from './Account/Credentials.js';
 import twoFactor from './Account/TwoFactor.js';
 import channels from './Channels/Channel.js';
 import streamRouter from './Channels/Stream.js';
+import streamStatus from './Channels/StreamStatus.js';
 import thumbnail from './Channels/Thumbnail.js';
 import logo from './Channels/Logo.js';
 import metadata from './Channels/Metadata.js';
@@ -120,7 +121,8 @@ app.route('/api/account/credentials', credentials);
 app.route('/api/account/2fa', twoFactor);
 
 // Modular Channel Routes
-app.route('/api/channels', streamRouter);
+app.route('/api/channels/stream', streamRouter);
+app.route('/api/channels/status', streamStatus);
 
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/logo', logo);
@@ -141,33 +143,49 @@ app.notFound(notFoundHandler);
 export default async function handler(req: any, res: any) {
   const protocol = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host;
+  
+  // req.url in Node includes the query string (e.g. /path?id=123)
   const fullUrl = `${protocol}://${host}${req.url}`;
+  
+  console.log(`[Vercel] Handling ${req.method} ${fullUrl}`);
   
   try {
     const result = await app.fetch(new Request(fullUrl, {
       method: req.method,
       headers: req.headers,
       body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
-      // @ts-ignore
+      // @ts-ignore - duplex: 'half' is required for streaming bodies in some environments
       duplex: 'half'
     }));
     
+    // Set status
     res.statusCode = result.status;
+    
+    // Copy headers safely
     result.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'content-encoding') res.setHeader(key, value);
+      res.setHeader(key, value);
     });
 
     if (result.body) {
+      // Use streaming for better performance and support for binary data (thumbnails)
       Readable.fromWeb(result.body as any).pipe(res);
     } else {
       res.end();
     }
+
+    console.log(`[Vercel] Response sent: ${result.status}`);
   } catch (err: any) {
     console.error('[Vercel] Fatal error:', err);
     res.statusCode = 500;
     if (!res.headersSent) {
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ code: 500, message: 'Fatal Server Error' }));
+      const requestId = req.headers['x-vercel-id'] || req.headers['x-request-id'] || 'internal';
+      res.end(JSON.stringify({ 
+        code: 500, 
+        message: 'Fatal Server Error', 
+        request_id: requestId,
+        url: fullUrl 
+      }));
     }
   }
 }
