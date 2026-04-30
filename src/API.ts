@@ -91,28 +91,6 @@ app.get('/api/image', async (c) => {
   return c.json({ error: 'Image not found' }, 404);
 });
 
-app.get('/api/admin/cleanup', (c) => {
-  console.log('🧹 Running daily thumbnail cleanup...');
-  const tempDir = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
-  if (fs.existsSync(tempDir)) {
-    const files = fs.readdirSync(tempDir);
-    const now = Date.now();
-    let count = 0;
-    files.forEach(file => {
-      const filePath = path.join(tempDir, file);
-      try {
-        const stats = fs.statSync(filePath);
-        if (now - stats.mtimeMs > 24 * 60 * 60 * 1000) {
-          fs.unlinkSync(filePath);
-          count++;
-        }
-      } catch (e) {}
-    });
-    return c.json({ message: `Cleanup complete. Deleted ${count} files.` });
-  }
-  return c.json({ message: 'No cleanup needed.' });
-});
-
 // 5. Routes registration
 app.route('/auth/signup', signUp);
 app.route('/auth/signin', signIn);
