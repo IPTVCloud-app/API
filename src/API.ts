@@ -102,7 +102,6 @@ app.route('/api/account/2fa', twoFactor);
 
 // Modular Channel Routes
 app.route('/api/channels/stream', streamRouter);
-app.route('/api/channels/status', streamStatus);
 
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/logo', logo);
