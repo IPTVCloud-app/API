@@ -30,6 +30,7 @@ import playlists from './Channels/Playlists.js';
 // Core Imports
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
 import { supabase } from './Database/DB.js';
+import { getSystemStatus } from './Utils/StatusCheck.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -68,8 +69,9 @@ app.get('/', (c) => {
   return c.redirect(frontendUrl);
 });
 
-app.get('/api/health', (c) => {
-  return c.json({ status: 'ok', time: new Date().toISOString(), database: !!supabase });
+app.get('/api/status', async (c) => {
+  const status = await getSystemStatus();
+  return c.json(status);
 });
 
 app.get('/api/image', async (c) => {
