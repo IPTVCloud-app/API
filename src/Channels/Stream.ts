@@ -6,9 +6,7 @@ const router = new Hono();
 const STREAMS_URL = process.env.STREAMS_URL || 'https://iptvcloud-app.github.io/EPG/streams.json';
 const STREAM_TTL = 1000 * 60 * 60;
 const MANIFEST_TTL = 3000;
-const SEGMENT_TTL = 1000 * 30;
 const MAX_MANIFEST_CACHE_ENTRIES = 120;
-const MAX_SEGMENT_CACHE_ENTRIES = 800;
 
 type StreamVariant = {
   url: string;
@@ -17,17 +15,8 @@ type StreamVariant = {
 
 type StreamIndex = Map<string, StreamVariant[]>;
 
-type SegmentPayload = {
-  data: ArrayBuffer;
-  type: string;
-};
-
 type TimedManifest = {
   content: string;
-  ts: number;
-};
-
-type TimedSegment = SegmentPayload & {
   ts: number;
 };
 
@@ -38,8 +27,6 @@ const idCache = new Map<string, string>();
 
 const manifestCache = new Map<string, TimedManifest>();
 const inflightManifests = new Map<string, Promise<string>>();
-const segmentCache = new Map<string, TimedSegment>();
-const inflightSegments = new Map<string, Promise<SegmentPayload>>();
 
 function trimCache(cache: Map<string, unknown>, maxEntries: number) {
   while (cache.size > maxEntries) {
@@ -119,41 +106,6 @@ function pickVariant(list: StreamVariant[], resParam?: string | null, hlsOnly = 
 
   const firstManifest = candidates.find((item) => isHlsManifest(item.url));
   return firstManifest || candidates[0];
-}
-
-async function fetchSegment(url: string) {
-  const now = Date.now();
-
-  const cached = segmentCache.get(url);
-  if (cached && now - cached.ts < SEGMENT_TTL) return cached;
-  if (cached && now - cached.ts >= SEGMENT_TTL) segmentCache.delete(url);
-
-  if (inflightSegments.has(url)) return inflightSegments.get(url)!;
-
-  const promise: Promise<SegmentPayload> = (async () => {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(12000),
-    });
-
-    if (!res.ok) throw new Error(`segment ${res.status}`);
-
-    const data = await res.arrayBuffer();
-    const type = res.headers.get('Content-Type') || 'video/MP2T';
-
-    segmentCache.set(url, { data, type, ts: Date.now() });
-    trimCache(segmentCache, MAX_SEGMENT_CACHE_ENTRIES);
-
-    return { data, type };
-  })();
-
-  inflightSegments.set(url, promise);
-
-  try {
-    return await promise;
-  } finally {
-    inflightSegments.delete(url);
-  }
 }
 
 function rewriteManifest(content: string, baseUrl: string, channelId: string) {
@@ -294,7 +246,11 @@ router.get('/', async (c) => {
       return new Response(rewritten, {
         headers: {
           'Content-Type': 'application/vnd.apple.mpegurl',
-          'Cache-Control': 'public, max-age=3',
+          // Vercel Edge Cache for Manifests: 
+          // max-age=0 (browser doesn't cache)
+          // s-maxage=2 (Edge caches for 2s)
+          // stale-while-revalidate=2 (Serve stale instantly, update in background)
+          'Cache-Control': 'public, max-age=0, s-maxage=2, stale-while-revalidate=2',
           'Access-Control-Allow-Origin': '*',
         },
       });
@@ -304,12 +260,24 @@ router.get('/', async (c) => {
   }
 
   try {
-    const seg = await fetchSegment(targetUrl);
-    return new Response(seg.data, {
+    const res = await fetch(targetUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (!res.ok) throw new Error(`segment ${res.status}`);
+
+    const type = res.headers.get('Content-Type') || 'video/MP2T';
+
+    // Direct Stream Piping (Zero-Copy) using Vercel Edge Cache for Segments
+    return new Response(res.body, {
       headers: {
-        'Content-Type': seg.type,
+        'Content-Type': type,
         'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=3600',
+        // Vercel Edge Cache for Segments:
+        // max-age=3600 (browser caches for 1hr)
+        // s-maxage=31536000 (Edge caches for 1 year, segments are immutable)
+        'Cache-Control': 'public, max-age=3600, s-maxage=31536000, stale-while-revalidate=86400',
         'Accept-Ranges': 'bytes',
       },
     });
