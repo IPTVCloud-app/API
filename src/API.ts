@@ -106,6 +106,7 @@ app.route('/api/channels/stream', streamRouter);
 app.route('/api/channels/thumbnail', thumbnail);
 app.route('/api/channels/logo', logo);
 app.route('/api/channels/meta', metadata); // New base for categories, languages, etc.
+app.route('/api/channels/wiki', wiki);
 app.route('/api/channels', iptv);
 app.route('/api/channels', channels);
 app.route('/api/playlists', playlists);

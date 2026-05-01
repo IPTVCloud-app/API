@@ -109,7 +109,7 @@ router.get('/', async (c) => {
           stream: `${baseUrl}/api/channels/stream?id=${shortId}`,
           thumbnail: `${baseUrl}/api/channels/thumbnail?id=${shortId}`,
           status,
-          available_resolutions: streams.map((s: any) => s.quality).filter(Boolean),
+          available_resolutions: Array.from(new Set(streams.map((s: any) => s.quality).filter(Boolean))),
           abr_supported: streams.length > 1
         };
       })
@@ -187,7 +187,7 @@ router.get('/:id', async (c) => {
       stream: `${baseUrl}/api/channels/stream?id=${id}`,
       thumbnail: `${baseUrl}/api/channels/thumbnail?id=${id}`,
       status,
-      available_resolutions: streams.map((s: any) => s.quality).filter(Boolean),
+      available_resolutions: Array.from(new Set(streams.map((s: any) => s.quality).filter(Boolean))),
       abr_supported: streams.length > 1
     });
   } catch (error) {

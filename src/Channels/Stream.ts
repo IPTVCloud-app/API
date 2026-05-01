@@ -47,7 +47,7 @@ async function getStreamIndex() {
       for (const s of streams) {
         if (!s.channel || !s.url) continue;
         if (!map.has(s.channel)) map.set(s.channel, []);
-        map.get(s.channel)!.push({ url: s.url });
+        map.get(s.channel)!.push({ url: s.url, quality: s.quality });
       }
 
       streamIndex = map;
@@ -164,6 +164,7 @@ function rewriteManifest(content: string, baseUrl: string, channelId: string) {
 router.get('/', async (c) => {
   const id = c.req.query('id');
   const segment = c.req.query('segment');
+  const resParam = c.req.query('res');
 
   if (!id) return c.json({ error: 'Missing id' }, 400);
 
@@ -171,9 +172,16 @@ router.get('/', async (c) => {
   const streams = await getStreamIndex();
   const list = streams.get(originalId);
 
-  const targetUrl = segment
-    ? decodeURIComponent(segment)
-    : list?.[0]?.url;
+  let targetUrl = list?.[0]?.url;
+
+  if (resParam && list) {
+    const match = list.find((s: any) => s.quality === resParam || (s.quality && s.quality.includes(resParam)));
+    if (match) targetUrl = match.url;
+  }
+
+  if (segment) {
+    targetUrl = decodeURIComponent(segment);
+  }
 
   if (!targetUrl) return c.json({ error: 'Stream not found' }, 404);
 

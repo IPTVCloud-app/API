@@ -82,7 +82,7 @@ router.get('/', async (c) => {
     }
 
     try {
-      await sharp(buffer).resize(400, 400, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp({ quality: 80 }).toFile(thumbPath);
+      await sharp(buffer).webp({ quality: 80 }).toFile(thumbPath);
       return c.body(fs.readFileSync(thumbPath) as any, 200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' });
     } catch (e) {
       return c.body(buffer as any, 200, { 'Content-Type': 'image/png' });
