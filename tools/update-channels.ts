@@ -34,14 +34,14 @@ async function updateChannels() {
 
     await sql`
       INSERT INTO iptv_categories ${sql(categories.map((c: any) => ({
-        id: c.id, name: c.name
-      })))} ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+        id: c.id, name: c.name, description: c.description || null, updated_at: new Date()
+      })))} ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at
     `;
 
     await sql`
       INSERT INTO iptv_languages ${sql(languages.map((l: any) => ({
-        code: l.code, name: l.name
-      })))} ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name
+        code: l.code, name: l.name, updated_at: new Date()
+      })))} ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at
     `;
 
     // 2. Sync Channels

@@ -1,134 +1,226 @@
 import { Hono } from 'hono';
-import axios from 'axios';
 import { getOriginalId } from './Utils.js';
 
 const router = new Hono();
 
 const STREAMS_URL = 'https://iptvcloud-app.github.io/EPG/streams.json';
 
-let streamIndex: Map<string, any[]> | null = null;
-let lastLoad = 0;
-const TTL = 1000 * 60 * 60;
+const STREAM_TTL = 1000 * 60 * 60;
+const MANIFEST_TTL = 3000;
+const SEGMENT_TTL = 1000 * 30; // 30s segment cache (critical)
 
 // -------------------------
 // STREAM INDEX
 // -------------------------
+let streamIndex: Map<string, any[]> | null = null;
+let lastLoad = 0;
+let loadingPromise: Promise<Map<string, any[]>> | null = null;
+
+const idCache = new Map<string, string>();
+
+// -------------------------
+// SEGMENT CACHE + IN-FLIGHT DEDUPE
+// -------------------------
+const segmentCache = new Map<string, { data: ArrayBuffer; type: string; ts: number }>();
+const inflightSegments = new Map<string, Promise<{ data: ArrayBuffer; type: string }>>();
+
+// -------------------------
+// STREAM INDEX LOADER
+// -------------------------
 async function getStreamIndex() {
   const now = Date.now();
-  if (streamIndex && now - lastLoad < TTL) return streamIndex;
 
-  const map = new Map<string, any[]>();
+  if (streamIndex && now - lastLoad < STREAM_TTL) return streamIndex;
+  if (loadingPromise) return loadingPromise;
 
-  try {
-    const res = await axios.get(STREAMS_URL);
-    const data = Array.isArray(res.data) ? res.data : (res.data.streams || []);
+  loadingPromise = (async () => {
+    try {
+      const res = await fetch(STREAMS_URL, {
+        signal: AbortSignal.timeout(8000),
+      });
 
-    for (const s of data) {
-      if (!s.channel) continue;
-      const list = map.get(s.channel) || [];
-      list.push({ url: s.url });
-      map.set(s.channel, list);
+      const data = await res.json();
+      const streams = Array.isArray(data) ? data : data.streams || [];
+
+      const map = new Map<string, any[]>();
+
+      for (const s of streams) {
+        if (!s.channel || !s.url) continue;
+        if (!map.has(s.channel)) map.set(s.channel, []);
+        map.get(s.channel)!.push({ url: s.url });
+      }
+
+      streamIndex = map;
+      lastLoad = Date.now();
+
+      return map;
+    } finally {
+      loadingPromise = null;
     }
+  })();
 
-    streamIndex = map;
-    lastLoad = now;
-  } catch (err) {
-    console.error('Failed to load stream index:', err);
+  return loadingPromise;
+}
+
+// -------------------------
+// ID CACHE
+// -------------------------
+async function cachedOriginalId(id: string) {
+  if (idCache.has(id)) return idCache.get(id)!;
+
+  const val = await getOriginalId(id);
+  idCache.set(id, val);
+  return val;
+}
+
+// -------------------------
+// SEGMENT FETCH (CRITICAL OPTIMIZATION)
+// -------------------------
+async function fetchSegment(url: string) {
+  const now = Date.now();
+
+  // cache hit
+  const cached = segmentCache.get(url);
+  if (cached && now - cached.ts < SEGMENT_TTL) {
+    return cached;
   }
 
-  return map;
+  // in-flight dedupe
+  if (inflightSegments.has(url)) {
+    return inflightSegments.get(url)!;
+  }
+
+  const promise = (async () => {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (!res.ok) throw new Error(`Segment ${res.status}`);
+
+    const data = await res.arrayBuffer();
+
+    const type = res.headers.get('Content-Type') || 'video/MP2T';
+
+    segmentCache.set(url, {
+      data,
+      type,
+      ts: Date.now(),
+    });
+
+    return { data, type };
+  })();
+
+  inflightSegments.set(url, promise);
+
+  try {
+    return await promise;
+  } finally {
+    inflightSegments.delete(url);
+  }
 }
 
-/**
- * Robust Manifest Rewriter
- * Handles both Master and Media playlists
- */
-function rewriteManifest(content: string, baseUrl: string, channelId: string): string {
-  const lines = content.split('\n');
+// -------------------------
+// MANIFEST REWRITE (FAST)
+// -------------------------
+function rewriteManifest(content: string, baseUrl: string, channelId: string) {
   const base = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+  const lines = content.split('\n');
 
-  return lines.map(line => {
+  const out: string[] = [];
+
+  for (const line of lines) {
     const t = line.trim();
-    if (!t || t.startsWith('#')) return line;
 
-    // Convert relative to absolute
-    let absUrl = t;
-    try {
-      if (!t.startsWith('http')) {
-        absUrl = new URL(t, base).href;
-      }
-    } catch (e) {
-      return line;
+    if (!t || t.startsWith('#')) {
+      out.push(line);
+      continue;
     }
 
-    // Proxy everything through our endpoint
-    return `/api/channels/stream?id=${channelId}&segment=${encodeURIComponent(absUrl)}`;
-  }).join('\n');
+    let abs = t;
+
+    if (!t.startsWith('http')) {
+      try {
+        abs = new URL(t, base).href;
+      } catch {
+        out.push(line);
+        continue;
+      }
+    }
+
+    out.push(
+      `/api/channels/stream?id=${channelId}&segment=${encodeURIComponent(abs)}`
+    );
+  }
+
+  return out.join('\n');
 }
 
+// -------------------------
+// ROUTE
+// -------------------------
 router.get('/', async (c) => {
   const id = c.req.query('id');
   const segment = c.req.query('segment');
 
   if (!id) return c.json({ error: 'Missing id' }, 400);
 
-  // Resolve shortId to originalId
-  const originalId = await getOriginalId(id);
-
+  const originalId = await cachedOriginalId(id);
   const streams = await getStreamIndex();
   const list = streams.get(originalId);
 
-  // If no segment is requested, we are fetching the initial manifest
-  const targetUrl = segment ? decodeURIComponent(segment) : (list?.[0]?.url);
+  const targetUrl = segment
+    ? decodeURIComponent(segment)
+    : list?.[0]?.url;
 
-  if (!targetUrl) {
-    return c.json({ error: 'Stream not found' }, 404);
+  if (!targetUrl) return c.json({ error: 'Stream not found' }, 404);
+
+  const isManifest = targetUrl.includes('.m3u8');
+
+  // -------------------------
+  // MANIFEST
+  // -------------------------
+  if (isManifest) {
+    const res = await fetch(targetUrl, {
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) return c.json({ error: 'manifest fail' }, 502);
+
+    const text = await res.text();
+    const rewritten = rewriteManifest(text, targetUrl, id);
+
+    return new Response(rewritten, {
+      headers: {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'public, max-age=3',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   }
 
+  // -------------------------
+  // SEGMENT (OPTIMIZED PATH)
+  // -------------------------
   try {
-    const response = await fetch(targetUrl, {
+    const seg = await fetchSegment(targetUrl);
+
+    return new Response(seg.data, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`Upstream returned ${response.status}`);
-    }
-
-    const contentType = response.headers.get('Content-Type') || '';
-    const isManifest = targetUrl.toLowerCase().includes('.m3u8') || 
-                       contentType.includes('mpegurl') || 
-                       contentType.includes('application/x-mpegurl');
-
-    if (isManifest) {
-      const text = await response.text();
-      const rewritten = rewriteManifest(text, targetUrl, id);
-
-      return new Response(rewritten, {
-        headers: {
-          'Content-Type': 'application/vnd.apple.mpegurl',
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache',
-          'Expires': '0'
-        }
-      });
-    }
-
-    // For segments (binary data)
-    return new Response(response.body, {
-      headers: {
-        'Content-Type': contentType || 'video/MP2T',
+        'Content-Type': seg.type,
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=3600',
-        'Accept-Ranges': 'bytes'
-      }
+        'Accept-Ranges': 'bytes',
+      },
     });
 
-  } catch (error: any) {
-    console.error(`[Proxy Error] ${targetUrl}:`, error.message);
-    return c.json({ error: 'Failed to proxy stream', detail: error.message }, 502);
+  } catch (err: any) {
+    return c.json(
+      { error: 'segment failed', detail: err.message },
+      502
+    );
   }
 });
 

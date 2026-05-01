@@ -38,10 +38,14 @@ async function syncIPTV() {
     await sql`
       INSERT INTO iptv_categories ${sql(categories.map((c: any) => ({
         id: c.id,
-        name: c.name
+        name: c.name,
+        description: c.description || null,
+        updated_at: new Date()
       })))}
       ON CONFLICT (id) DO UPDATE SET
-        name = EXCLUDED.name
+        name = EXCLUDED.name,
+        description = EXCLUDED.description,
+        updated_at = EXCLUDED.updated_at
     `;
 
     // 3. Sync Languages
@@ -50,10 +54,12 @@ async function syncIPTV() {
     await sql`
       INSERT INTO iptv_languages ${sql(languages.map((l: any) => ({
         code: l.code,
-        name: l.name
+        name: l.name,
+        updated_at: new Date()
       })))}
       ON CONFLICT (code) DO UPDATE SET
-        name = EXCLUDED.name
+        name = EXCLUDED.name,
+        updated_at = EXCLUDED.updated_at
     `;
 
     // 4. Sync Channels (In batches to avoid memory/SQL issues)

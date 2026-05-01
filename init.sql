@@ -173,12 +173,15 @@ CREATE TABLE IF NOT EXISTS iptv_countries (
 
 CREATE TABLE IF NOT EXISTS iptv_categories (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    description TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS iptv_languages (
     code TEXT PRIMARY KEY,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS iptv_channels (

@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { supabase } from '../Database/DB.js';
+import { getCategoriesWithCache, getLanguagesWithCache } from './Utils.js';
 
 const router = new Hono();
 
@@ -9,12 +10,7 @@ const router = new Hono();
 
 router.get('/categories', async (c) => {
   try {
-    const { data, error } = await supabase
-      .from('iptv_categories')
-      .select('*')
-      .order('name', { ascending: true });
-    
-    if (error) throw error;
+    const data = await getCategoriesWithCache();
     return c.json(data);
   } catch (err) {
     console.error('[Metadata] Categories fetch error:', err);
@@ -24,12 +20,7 @@ router.get('/categories', async (c) => {
 
 router.get('/languages', async (c) => {
   try {
-    const { data, error } = await supabase
-      .from('iptv_languages')
-      .select('code, name')
-      .order('name', { ascending: true });
-    
-    if (error) throw error;
+    const data = await getLanguagesWithCache();
     return c.json(data);
   } catch (err) {
     console.error('[Metadata] Languages fetch error:', err);

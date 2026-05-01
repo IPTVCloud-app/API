@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { supabase } from '../Database/DB.js';
+import { getCategoriesWithCache, getLanguagesWithCache } from './Utils.js';
 
 const router = new Hono();
 
@@ -8,13 +9,21 @@ const router = new Hono();
  */
 
 router.get('/categories', async (c) => {
-  const { data } = await supabase.from('iptv_categories').select('*').order('name');
-  return c.json(data);
+  try {
+    const data = await getCategoriesWithCache();
+    return c.json(data);
+  } catch (err) {
+    return c.json({ error: 'Failed to fetch categories' }, 500);
+  }
 });
 
 router.get('/languages', async (c) => {
-  const { data } = await supabase.from('iptv_languages').select('*').order('name');
-  return c.json(data);
+  try {
+    const data = await getLanguagesWithCache();
+    return c.json(data);
+  } catch (err) {
+    return c.json({ error: 'Failed to fetch languages' }, 500);
+  }
 });
 
 router.get('/countries', async (c) => {

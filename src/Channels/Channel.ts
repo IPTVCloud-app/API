@@ -125,7 +125,75 @@ router.get('/', async (c) => {
 
 router.get('/:id', async (c) => {
   const id = c.req.param('id');
-  return c.redirect(`/api/channels/stream?id=${id}`);
+  
+  try {
+    // Attempt to get original ID if short ID provided
+    const { data: mapping } = await supabase.from('channel_mappings').select('original_id').eq('short_id', id).single();
+    const originalId = mapping?.original_id || id;
+
+    const { data: ch, error } = await supabase
+      .from('iptv_channels')
+      .select(`
+        *,
+        iptv_streams (
+          url,
+          quality,
+          status,
+          last_checked_at
+        )
+      `)
+      .eq('id', originalId)
+      .single();
+
+    if (error || !ch) {
+      return c.json({ error: 'Channel not found' }, 404);
+    }
+
+    const streams = ch.iptv_streams || [];
+    let status = 'offline';
+    
+    if (streams.length > 0) {
+      const primary = streams.find((s: any) => s.status === 'online') || streams[0];
+      status = primary.status;
+      const lastChecked = new Date(primary.last_checked_at).getTime();
+      const isExpired = (Date.now() - lastChecked) > DB_CACHE_TTL_MS;
+
+      if (status === 'unknown' || (status === 'online' && isExpired)) {
+        const newStatus = await checkStreamStatus(primary.url);
+        if (newStatus !== status) {
+          status = newStatus;
+          supabase
+            .from('iptv_streams')
+            .update({ status: newStatus, last_checked_at: new Date().toISOString() })
+            .eq('channel_id', ch.id)
+            .eq('url', primary.url)
+            .then(() => {});
+        }
+      }
+    }
+
+    const baseUrl = process.env.PUBLIC_API_URL || c.req.url.split('/api/')[0];
+
+    return c.json({
+      id: id,
+      original_id: ch.id,
+      name: ch.name,
+      logo: ch.logo,
+      country: ch.country,
+      subdivision: ch.subdivision,
+      city: ch.city,
+      categories: ch.categories,
+      languages: ch.languages,
+      stream: `${baseUrl}/api/channels/stream?id=${id}`,
+      thumbnail: `${baseUrl}/api/channels/thumbnail?id=${id}`,
+      status,
+      available_resolutions: streams.map((s: any) => s.quality).filter(Boolean),
+      abr_supported: streams.length > 1
+    });
+  } catch (error) {
+    console.error('[Channel Fetch Error]', error);
+    return c.json({ error: 'Failed to fetch channel details' }, 500);
+  }
 });
 
 export default router;

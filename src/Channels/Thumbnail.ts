@@ -54,15 +54,31 @@ router.get('/', async (c) => {
     }
 
     const originalId = await getOriginalId(shortId);
-    const index = await getLogoIndex();
-    const logoUrl = index.get(originalId || '') || GITHUB_LOGO_FALLBACK;
+    
+    let buffer: Buffer | null = null;
 
-    let buffer: Buffer;
-    try {
-      const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-      buffer = Buffer.from(response.data);
-    } catch (err) {
-      return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
+    // 1. Try fetching EPG thumbnail first
+    if (originalId) {
+      try {
+        const epgThumbUrl = `https://iptvcloud-app.github.io/EPG/thumbnails/${originalId}.webp`;
+        const response = await axios.get(epgThumbUrl, { responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        buffer = Buffer.from(response.data);
+      } catch (err) {
+        // EPG thumbnail failed (e.g. 404), fall through to logo
+      }
+    }
+
+    // 2. Fallback to logo API
+    if (!buffer) {
+      const index = await getLogoIndex();
+      const logoUrl = index.get(originalId || '') || GITHUB_LOGO_FALLBACK;
+
+      try {
+        const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        buffer = Buffer.from(response.data);
+      } catch (err) {
+        return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
+      }
     }
 
     try {

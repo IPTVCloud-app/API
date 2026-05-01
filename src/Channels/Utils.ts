@@ -105,9 +105,78 @@ export async function getShortIds(originalIds: string[]): Promise<Record<string,
   }
 }
 
-export async function getOriginalId(shortId: string): Promise<string | null> {
+export async function getOriginalId(shortId: string): Promise<string> {
   try {
     const { data: existing } = await supabase.from('channel_mappings').select('original_id').eq('short_id', shortId).single();
     return existing?.original_id || shortId;
   } catch (err) { return shortId; }
+}
+
+export async function getCategoriesWithCache() {
+  const { data: categories } = await supabase
+    .from('iptv_categories')
+    .select('*')
+    .order('name', { ascending: true });
+
+  const now = Date.now();
+  const lastUpdated = categories?.[0]?.updated_at ? new Date(categories[0].updated_at).getTime() : 0;
+
+  if (!categories || categories.length === 0 || (now - lastUpdated) > 15 * 60 * 1000) {
+    try {
+      const response = await axios.get('https://iptv-org.github.io/api/categories.json');
+      const fetched = response.data;
+      const timestamp = new Date().toISOString();
+      
+      const upsertData = fetched.map((c: any) => ({
+        id: c.id,
+        name: c.name,
+        description: c.description || null,
+        updated_at: timestamp
+      }));
+      
+      for (let i = 0; i < upsertData.length; i += 1000) {
+        await supabase.from('iptv_categories').upsert(upsertData.slice(i, i + 1000), { onConflict: 'id' });
+      }
+      
+      return upsertData.sort((a: any, b: any) => a.name.localeCompare(b.name));
+    } catch (err) {
+      console.error('[Utils] Error fetching categories from external API:', err);
+    }
+  }
+
+  return categories || [];
+}
+
+export async function getLanguagesWithCache() {
+  const { data: languages } = await supabase
+    .from('iptv_languages')
+    .select('*')
+    .order('name', { ascending: true });
+
+  const now = Date.now();
+  const lastUpdated = languages?.[0]?.updated_at ? new Date(languages[0].updated_at).getTime() : 0;
+
+  if (!languages || languages.length === 0 || (now - lastUpdated) > 15 * 60 * 1000) {
+    try {
+      const response = await axios.get('https://iptv-org.github.io/api/languages.json');
+      const fetched = response.data;
+      const timestamp = new Date().toISOString();
+      
+      const upsertData = fetched.map((l: any) => ({
+        code: l.code,
+        name: l.name,
+        updated_at: timestamp
+      }));
+      
+      for (let i = 0; i < upsertData.length; i += 1000) {
+        await supabase.from('iptv_languages').upsert(upsertData.slice(i, i + 1000), { onConflict: 'code' });
+      }
+      
+      return upsertData.sort((a: any, b: any) => a.name.localeCompare(b.name)).map((l: any) => ({ code: l.code, name: l.name }));
+    } catch (err) {
+      console.error('[Utils] Error fetching languages from external API:', err);
+    }
+  }
+
+  return languages?.map(l => ({ code: l.code, name: l.name })) || [];
 }
