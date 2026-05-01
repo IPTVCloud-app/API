@@ -37,9 +37,14 @@ import os from 'os';
 import { Readable } from 'stream';
 
 const app = new Hono();
+const STREAM_ROUTE_PREFIX = '/api/channels/stream';
 
 // 1. Global Middleware
-app.use('*', logger());
+const requestLogger = logger();
+app.use('*', async (c, next) => {
+  if (c.req.path.startsWith(STREAM_ROUTE_PREFIX)) return next();
+  return requestLogger(c, next);
+});
 app.use('*', cors({
   origin: (origin) => origin || '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -50,19 +55,34 @@ app.use('*', cors({
 })); 
 
 // 2. Universal Rate Limiting
+const getRateLimitKey = (c: Context) => {
+  try {
+    return c.req.header('x-forwarded-for')?.split(',')[0] || c.req.header('x-real-ip') || 'anonymous';
+  } catch {
+    return 'anonymous';
+  }
+};
+
 const globalLimiter = rateLimiter({
   windowMs: 15 * 60 * 1000,
   limit: 200,
   standardHeaders: 'draft-6',
-  keyGenerator: (c) => {
-    try {
-      return c.req.header('x-forwarded-for')?.split(',')[0] || c.req.header('x-real-ip') || 'anonymous';
-    } catch {
-      return 'anonymous';
-    }
-  },
+  keyGenerator: getRateLimitKey,
 });
-app.use('*', globalLimiter);
+
+const streamLimiter = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  limit: 4000,
+  standardHeaders: 'draft-6',
+  keyGenerator: getRateLimitKey,
+});
+
+app.use('*', async (c, next) => {
+  if (c.req.path.startsWith(STREAM_ROUTE_PREFIX)) {
+    return streamLimiter(c, next);
+  }
+  return globalLimiter(c, next);
+});
 
 app.get('/', (c) => {
   const frontendUrl = process.env.PUBLIC_FRONTEND_URL || 'https://iptvcloudapp.vercel.app';
