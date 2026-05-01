@@ -38,6 +38,10 @@ import { Readable } from 'stream';
 
 const app = new Hono();
 const STREAM_ROUTE_PREFIX = '/api/channels/stream';
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 // 1. Global Middleware
 const requestLogger = logger();
@@ -46,7 +50,12 @@ app.use('*', async (c, next) => {
   return requestLogger(c, next);
 });
 app.use('*', cors({
-  origin: (origin) => origin || '*',
+  origin: (origin) => {
+    if (!origin) return allowedOrigins[0] || '*';
+    if (allowedOrigins.length === 0) return origin;
+    if (allowedOrigins.includes(origin)) return origin;
+    return 'null';
+  },
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   exposeHeaders: ['Content-Length'],
@@ -98,14 +107,41 @@ app.get('/api/image', async (c) => {
   const src = c.req.query('src');
   if (!src) return c.json({ error: 'Source required' }, 400);
 
-  // Security: Prevent directory traversal
-  const safeSrc = src.replace(/\.\.\//g, '');
-  const assetPath = path.resolve(process.cwd(), '..', 'Assets', safeSrc);
+  const safeSrc = src
+    .replace(/\\/g, '/')
+    .replace(/\.\.(\/|\\)/g, '')
+    .replace(/^\/+/, '');
 
-  if (fs.existsSync(assetPath)) {
-    const ext = path.extname(assetPath).toLowerCase();
+  const candidatePaths = [
+    path.resolve(process.cwd(), '..', 'Assets', safeSrc),
+    path.resolve(process.cwd(), 'Assets', safeSrc),
+  ];
+
+  for (const candidate of candidatePaths) {
+    if (!fs.existsSync(candidate)) continue;
+    const ext = path.extname(candidate).toLowerCase();
     const contentType = ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : 'application/octet-stream';
-    return c.body(fs.readFileSync(assetPath) as any, 200, { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=3600' });
+    return c.body(fs.readFileSync(candidate) as any, 200, {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=3600',
+    });
+  }
+
+  try {
+    const remoteUrl = new URL(safeSrc, 'https://iptvcloud-app.github.io/Assets/').href;
+    const upstream = await fetch(remoteUrl, { signal: AbortSignal.timeout(8000) });
+    if (upstream.ok) {
+      const body = await upstream.arrayBuffer();
+      return new Response(body, {
+        headers: {
+          'Content-Type': upstream.headers.get('Content-Type') || 'application/octet-stream',
+          'Cache-Control': 'public, max-age=3600',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+  } catch {
+    // fallback to 404 below
   }
 
   return c.json({ error: 'Image not found' }, 404);

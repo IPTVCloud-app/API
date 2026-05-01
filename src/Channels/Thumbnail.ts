@@ -1,8 +1,5 @@
 import { Hono } from 'hono';
 import sharp from 'sharp';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
 import axios from 'axios';
 import { getOriginalId } from './Utils.js';
 
@@ -10,25 +7,56 @@ const router = new Hono();
 
 const LOGOS_URL = 'https://iptv-org.github.io/api/logos.json';
 const GITHUB_LOGO_FALLBACK = 'https://raw.githubusercontent.com/iptv-org/iptv/master/assets/logo.png';
-const TEMP_DIR = path.join(os.tmpdir(), 'iptvcloud-thumbnails');
-
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+type LogoItem = { channel?: string; url?: string };
 
 let logoIndex: Map<string, string> | null = null;
 let lastLoad = 0;
-const CACHE_TTL = 1000 * 60 * 60;
+const LOGO_INDEX_CACHE_TTL = 1000 * 60 * 60;
+
+const THUMB_CACHE_TTL = 1000 * 60 * 60 * 24;
+const MAX_THUMB_CACHE_ENTRIES = 2000;
+const thumbCache = new Map<string, { data: Buffer; contentType: string; expiresAt: number }>();
 
 async function getLogoIndex() {
   const now = Date.now();
-  if (logoIndex && (now - lastLoad) < CACHE_TTL) return logoIndex;
+  if (logoIndex && now - lastLoad < LOGO_INDEX_CACHE_TTL) return logoIndex;
   try {
     const res = await axios.get(LOGOS_URL);
-    const newIndex = new Map<string, string>();
-    res.data.forEach((l: any) => { if (l.channel && l.url) newIndex.set(l.channel, l.url); });
-    logoIndex = newIndex;
+    const items = Array.isArray(res.data) ? (res.data as LogoItem[]) : [];
+    const next = new Map<string, string>();
+    items.forEach((item) => {
+      if (item.channel && item.url) next.set(item.channel, item.url);
+    });
+    logoIndex = next;
     lastLoad = now;
     return logoIndex;
-  } catch (err) { return logoIndex || new Map(); }
+  } catch {
+    return logoIndex || new Map<string, string>();
+  }
+}
+
+function setCachedThumbnail(id: string, data: Buffer, contentType: string) {
+  thumbCache.set(id, {
+    data,
+    contentType,
+    expiresAt: Date.now() + THUMB_CACHE_TTL,
+  });
+
+  while (thumbCache.size > MAX_THUMB_CACHE_ENTRIES) {
+    const firstKey = thumbCache.keys().next().value;
+    if (!firstKey) break;
+    thumbCache.delete(firstKey);
+  }
+}
+
+function binaryImageResponse(data: Buffer, contentType: string) {
+  const payload = new Uint8Array(data);
+  return new Response(payload, {
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400',
+    },
+  });
 }
 
 const BROKEN_IMAGE_SVG = Buffer.from(
@@ -43,52 +71,60 @@ router.get('/', async (c) => {
   const shortId = c.req.query('id');
   if (!shortId) return c.json({ error: 'Channel ID required' }, 400);
 
-  const thumbPath = path.join(TEMP_DIR, `thumb-${shortId}.webp`);
+  const cached = thumbCache.get(shortId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return binaryImageResponse(cached.data, cached.contentType);
+  }
+  if (cached && cached.expiresAt <= Date.now()) {
+    thumbCache.delete(shortId);
+  }
 
   try {
-    if (fs.existsSync(thumbPath)) {
-      const stats = fs.statSync(thumbPath);
-      if ((Date.now() - stats.mtimeMs) < 86400000) { 
-        return c.body(fs.readFileSync(thumbPath), 200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' });
-      }
-    }
-
     const originalId = await getOriginalId(shortId);
-    
     let buffer: Buffer | null = null;
+    let contentType = 'image/png';
 
-    // 1. Try fetching EPG thumbnail first
     if (originalId) {
       try {
         const epgThumbUrl = `https://iptvcloud-app.github.io/EPG/thumbnails/${originalId}.webp`;
-        const response = await axios.get(epgThumbUrl, { responseType: 'arraybuffer', timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const response = await axios.get(epgThumbUrl, {
+          responseType: 'arraybuffer',
+          timeout: 5000,
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+        });
         buffer = Buffer.from(response.data);
-      } catch (err) {
-        // EPG thumbnail failed (e.g. 404), fall through to logo
+        contentType = 'image/webp';
+      } catch {
+        // fall through to logo source
       }
     }
 
-    // 2. Fallback to logo API
     if (!buffer) {
       const index = await getLogoIndex();
       const logoUrl = index.get(originalId || '') || GITHUB_LOGO_FALLBACK;
-
       try {
-        const response = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const response = await axios.get(logoUrl, {
+          responseType: 'arraybuffer',
+          timeout: 8000,
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+        });
         buffer = Buffer.from(response.data);
-      } catch (err) {
+        contentType = typeof response.headers['content-type'] === 'string' ? response.headers['content-type'] : 'image/png';
+      } catch {
         return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
       }
     }
 
     try {
-      await sharp(buffer).webp({ quality: 80 }).toFile(thumbPath);
-      return c.body(fs.readFileSync(thumbPath) as any, 200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' });
-    } catch (e) {
-      return c.body(buffer as any, 200, { 'Content-Type': 'image/png' });
+      const webpBuffer = await sharp(buffer).webp({ quality: 80 }).toBuffer();
+      setCachedThumbnail(shortId, webpBuffer, 'image/webp');
+      return binaryImageResponse(webpBuffer, 'image/webp');
+    } catch {
+      setCachedThumbnail(shortId, buffer, contentType);
+      return binaryImageResponse(buffer, contentType);
     }
-  } catch (error) {
-    return c.body(BROKEN_IMAGE_SVG as any, 200, { 'Content-Type': 'image/svg+xml' });
+  } catch {
+    return c.body(BROKEN_IMAGE_SVG, 200, { 'Content-Type': 'image/svg+xml' });
   }
 });
 
